@@ -216,9 +216,13 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     // general_lock protects current->mm. otherwise procfs might read the
     // pointer before it's released and then try to lock it after it's
     // released.
+    struct mm *new_mm = mm_new();
+    if (new_mm == NULL)
+        return _ENOMEM;
     lock(&current->general_lock);
-    mm_release(current->mm);
-    task_set_mm(current, mm_new());
+    struct mm *old_mm = current->mm;
+    task_set_mm(current, new_mm);
+    mm_release(old_mm);
     unlock(&current->general_lock);
     write_wrlock(&current->mem->lock);
 
