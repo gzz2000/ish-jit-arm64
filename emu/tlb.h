@@ -98,4 +98,8 @@ forceinline __no_instrument bool tlb_write(struct tlb *tlb, addr_t addr, const v
     return true;
 }
 
+__no_instrument int c_stxr_cas(struct tlb *tlb, addr_t addr,
+                               uint64_t expected_val, uint64_t new_val,
+                               uint32_t size);
+
 #endif

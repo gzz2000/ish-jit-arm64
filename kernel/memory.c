@@ -18,6 +18,7 @@
 #include "kernel/task.h"
 #include "kernel/resource.h"
 #include "fs/fd.h"
+#include "emu/cpu.h"
 
 // increment the change count
 static void mem_changed(struct mem *mem);
@@ -599,6 +600,9 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
             continue;
 
         asbestos_invalidate_page(mem->mmu.asbestos, page);
+#if defined(GUEST_ARM64) && defined(__aarch64__)
+        arm64_jit_invalidate_page(&mem->mmu, page);
+#endif
         struct data *data = pt->data;
 #if ANON_MMAP_LIMIT_PAGES > 0
         // Decrement per-page for anonymous mappings. This correctly handles
@@ -898,6 +902,9 @@ have_entry:
         }
         // get rid of any compiled blocks in this page
         asbestos_invalidate_page(mem->mmu.asbestos, page);
+#if defined(GUEST_ARM64) && defined(__aarch64__)
+        arm64_jit_invalidate_page(&mem->mmu, page);
+#endif
         // if page is cow, ~~milk~~ copy it
         if (entry->flags & P_COW) {
             void *copy = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,

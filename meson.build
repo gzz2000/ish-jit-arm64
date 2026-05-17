@@ -62,6 +62,7 @@ offsets = custom_target('offsets',
 # Common emu sources
 emu_src = [
     'emu/tlb.c',
+    'emu/cpu_backend.c',
 ]
 
 # Architecture-specific emu sources
@@ -78,6 +79,13 @@ elif guest_arch == 'arm64'
         'emu/arch/arm64/fpu.c',
     ]
     gadgets_base = 'asbestos/guest-arm64/gadgets-'
+    if host_machine.cpu_family() == 'aarch64'
+        emu_src += [
+            'jit/guest-arm64/runtime.c',
+            'jit/guest-arm64/emit.c',
+            'jit/guest-arm64/helpers.S',
+        ]
+    endif
 endif
 
 gadgets = gadgets_base + host_machine.cpu_family()

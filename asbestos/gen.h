@@ -18,6 +18,7 @@ struct gen_state {
     uint32_t last_insn;
     struct tlb *tlb; // for peephole optimization (peek at next instruction)
     unsigned b_follow_depth; // how many unconditional B's we've followed inline
+    bool disable_fusion;
 };
 
 void gen_start(addr_t addr, struct gen_state *state);

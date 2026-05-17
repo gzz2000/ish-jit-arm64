@@ -572,11 +572,24 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
 static int cpu_single_step(struct cpu_state *cpu, struct tlb *tlb) {
     struct gen_state state;
     gen_start(CPU_IP(cpu), &state);
+    state.disable_fusion = true;
     gen_step(&state, tlb);
     gen_exit(&state);
     gen_end(&state);
 
     struct fiber_block *block = state.block;
+    static int trace_mode = -1;
+    if (trace_mode == -1) {
+        const char *env = getenv("ISH_ARM64_JIT_TRACE");
+        trace_mode = (env != NULL && env[0] == '1') ? 1 : 0;
+    }
+    if (trace_mode) {
+        fprintf(stderr, "[thread-oracle] block 0x%llx..0x%llx used=%zu next_ip=0x%llx\n",
+                (unsigned long long) block->addr,
+                (unsigned long long) block->end_addr,
+                block->used,
+                (unsigned long long) state.ip);
+    }
     struct fiber_frame frame = {.cpu = *cpu};
     int interrupt = fiber_enter(block, &frame, tlb);
     *cpu = frame.cpu;
@@ -586,7 +599,11 @@ static int cpu_single_step(struct cpu_state *cpu, struct tlb *tlb) {
     return interrupt;
 }
 
-int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
+int cpu_single_step_threaded_oracle(struct cpu_state *cpu, struct tlb *tlb) {
+    return cpu_single_step(cpu, tlb);
+}
+
+int cpu_run_to_interrupt_threaded(struct cpu_state *cpu, struct tlb *tlb) {
     ish_thread_marker = 1;
     if (cpu->poked_ptr == NULL)
         cpu->poked_ptr = &cpu->_poked;
@@ -626,6 +643,7 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         unlock(&asbestos->lock);
     }
 
+    cpu_log_interrupt_boundary("threaded", cpu, interrupt);
     return interrupt;
 }
 

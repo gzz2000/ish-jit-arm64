@@ -1091,6 +1091,8 @@ static bool simd_modimm_pattern(uint32_t cmode, uint8_t imm8, uint64_t *pattern)
  * Returns true if successful, false if read fails.
  */
 static bool gen_peek_next_insn(struct gen_state *state, uint32_t *next_insn) {
+    if (state->disable_fusion)
+        return false;
     return tlb_read(state->tlb, state->ip, next_insn, sizeof(*next_insn));
 }
 

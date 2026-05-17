@@ -101,6 +101,10 @@ struct task {
     pid_t native_pid;
     bool is_native_proxy;
 
+    // Runtime-selected execution backend for this task.
+    // Defaults to CPU_BACKEND_UNSET and is fixed on first execution.
+    int exec_backend;
+
     // current condition/lock, so it can be notified in case of a signal
     cond_t *waiting_cond;
     lock_t *waiting_lock;
