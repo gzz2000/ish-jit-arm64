@@ -8,6 +8,31 @@
 #include "kernel/calls.h"
 
 __thread struct arm64_jit_runtime *g_arm64_jit_runtime;
+extern __thread volatile sig_atomic_t in_jit;
+
+struct arm64_jit_verify_store_snapshot {
+    bool valid;
+    addr_t addr;
+    uint32_t size;
+    uint8_t before[8];
+    uint8_t after[8];
+};
+
+struct arm64_jit_verify_state {
+    struct cpu_state expected_cpu;
+    struct tlb expected_tlb;
+    struct arm64_jit_verify_store_snapshot store_snap;
+    bool active;
+    bool failed;
+    bool have_pending_result;
+    bool trap_env_valid;
+    uint64_t steps;
+    addr_t last_guest_pc;
+    int pending_interrupt;
+    sigjmp_buf trap_env;
+};
+
+static __thread struct arm64_jit_verify_state g_arm64_jit_verify;
 
 struct mmu_arm64_jit_slot {
     struct mmu *mmu;
@@ -18,6 +43,20 @@ static struct mmu_arm64_jit_slot g_arm64_jit_slots[64];
 static lock_t g_arm64_jit_slots_lock = LOCK_INITIALIZER;
 
 static uint64_t arm64_jit_read_gpr(struct cpu_state *cpu, uint32_t reg, bool sp_not_zr);
+static bool arm64_jit_cpu_equal(const struct cpu_state *a, const struct cpu_state *b);
+static void arm64_jit_dump_cpu_diff(const struct cpu_state *expected, const struct cpu_state *actual,
+        addr_t start_pc, int expected_interrupt, int actual_interrupt);
+static void arm64_jit_dump_verify_step(uint64_t step, addr_t start_pc,
+        const struct cpu_state *expected, const struct cpu_state *actual,
+        int expected_interrupt, int actual_interrupt);
+static struct arm64_jit_verify_store_snapshot arm64_jit_verify_snapshot_store_before(
+        struct cpu_state *cpu, struct tlb *tlb, uint32_t insn);
+static void arm64_jit_verify_snapshot_capture_after(struct arm64_jit_verify_store_snapshot *snap,
+        struct tlb *tlb);
+static void arm64_jit_verify_snapshot_restore_before(struct arm64_jit_verify_store_snapshot *snap,
+        struct tlb *tlb);
+static void arm64_jit_verify_snapshot_restore_after(struct arm64_jit_verify_store_snapshot *snap,
+        struct tlb *tlb);
 
 static struct arm64_jit_state *arm64_jit_state_new(struct mmu *mmu) {
     struct arm64_jit_state *state = calloc(1, sizeof(*state));
@@ -79,6 +118,109 @@ int arm64_jit_verify_mode(void) {
         verify_mode = (env != NULL && env[0] == '1') ? 1 : 0;
     }
     return verify_mode;
+}
+
+static const struct arm64_jit_verify_site *arm64_jit_find_verify_site(
+        const struct arm64_jit_block *block, uint32_t off) {
+    for (uint32_t i = 0; i < block->verify_site_count; i++) {
+        if (block->verify_sites[i].host_offset == off)
+            return &block->verify_sites[i];
+    }
+    return NULL;
+}
+
+static struct cpu_state arm64_jit_capture_verify_cpu(const struct arm64_jit_block *block,
+        const struct cpu_state *cpu, ucontext_t *uc, addr_t guest_pc) {
+    struct cpu_state captured = *cpu;
+    captured.pc = guest_pc;
+#if defined(__aarch64__)
+    for (uint32_t guest = 0; guest < 31; guest++) {
+        int host = arm64_jit_host_reg_for_guest(block, guest);
+        if (host < 0)
+            continue;
+        if (host <= 28)
+            captured.regs[guest] = uc->uc_mcontext->__ss.__x[host];
+        else if (host == 29)
+            captured.regs[guest] = uc->uc_mcontext->__ss.__fp;
+        else if (host == 30)
+            captured.regs[guest] = uc->uc_mcontext->__ss.__lr;
+    }
+    captured.sp = uc->uc_mcontext->__ss.__x[ARM64_JIT_HOST_GUEST_SP];
+    captured.nzcv = uc->uc_mcontext->__ss.__cpsr & 0xf0000000u;
+    arm64_set_nzcv(&captured, captured.nzcv);
+    for (uint32_t i = 0; i < 32; i++)
+        captured.fp[i].q = uc->uc_mcontext->__ns.__v[i];
+    captured.fpsr = uc->uc_mcontext->__ns.__fpsr;
+    captured.fpcr = uc->uc_mcontext->__ns.__fpcr;
+#endif
+    return captured;
+}
+
+int arm64_jit_handle_verify_sigtrap(void *ctx) {
+#if defined(__aarch64__)
+    if (!arm64_jit_verify_mode() || !in_jit || g_arm64_jit_runtime == NULL ||
+            g_arm64_jit_runtime->block == NULL)
+        return 0;
+    ucontext_t *uc = (ucontext_t *) ctx;
+    struct arm64_jit_block *block = g_arm64_jit_runtime->block;
+    uintptr_t base = (uintptr_t) block->code_rx;
+    uintptr_t pc = (uintptr_t) uc->uc_mcontext->__ss.__pc;
+    if (pc < base || pc >= base + block->code_size)
+        return 0;
+    uint32_t off = (uint32_t) (pc - base);
+    const struct arm64_jit_verify_site *site = arm64_jit_find_verify_site(block, off);
+    if (site == NULL)
+        return 0;
+    struct arm64_jit_verify_state *vs = &g_arm64_jit_verify;
+    if (!vs->active) {
+        vs->expected_cpu = *g_arm64_jit_runtime->cpu;
+        vs->expected_tlb = *g_arm64_jit_runtime->tlb;
+        vs->active = true;
+    }
+    struct cpu_state actual_cpu = arm64_jit_capture_verify_cpu(block,
+            g_arm64_jit_runtime->cpu, uc, site->guest_pc);
+    if (arm64_jit_trace_mode() &&
+            (site->guest_pc == 0xefeb36a0 || site->guest_pc == 0xefeb36a4 ||
+             site->guest_pc == 0xefeb36a8 || site->guest_pc == 0xefeb36ac ||
+             site->guest_pc == 0xefeb36d4 || site->guest_pc == 0xefeb36d8)) {
+        fprintf(stderr,
+                "[arm64-jit-verify] trap pc=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x5=0x%llx nzcv=0x%x expected_x3=0x%llx expected_x5=0x%llx expected_pc=0x%llx\n",
+                (unsigned long long) site->guest_pc,
+                (unsigned long long) actual_cpu.regs[0],
+                (unsigned long long) actual_cpu.regs[1],
+                (unsigned long long) actual_cpu.regs[2],
+                (unsigned long long) actual_cpu.regs[3],
+                (unsigned long long) actual_cpu.regs[5],
+                actual_cpu.nzcv,
+                (unsigned long long) vs->expected_cpu.regs[3],
+                (unsigned long long) vs->expected_cpu.regs[5],
+                (unsigned long long) vs->expected_cpu.pc);
+    }
+    if (!arm64_jit_cpu_equal(&vs->expected_cpu, &actual_cpu)) {
+        arm64_jit_dump_cpu_diff(&vs->expected_cpu, &actual_cpu, site->guest_pc,
+                INT_NONE, INT_NONE);
+        vs->failed = true;
+        g_arm64_jit_runtime->resume_pc = site->guest_pc;
+        g_arm64_jit_runtime->cpu->pc = site->guest_pc;
+        g_arm64_jit_runtime->exit_interrupt = INT_DEBUG;
+        if (vs->trap_env_valid)
+            siglongjmp(vs->trap_env, 1);
+        return 0;
+    }
+    vs->store_snap = arm64_jit_verify_snapshot_store_before(&vs->expected_cpu, &vs->expected_tlb, site->insn);
+    int expected_interrupt = cpu_single_step_threaded_oracle(&vs->expected_cpu, &vs->expected_tlb);
+    arm64_jit_verify_snapshot_capture_after(&vs->store_snap, &vs->expected_tlb);
+    arm64_jit_verify_snapshot_restore_before(&vs->store_snap, &vs->expected_tlb);
+    vs->steps++;
+    vs->last_guest_pc = site->guest_pc;
+    vs->pending_interrupt = expected_interrupt;
+    vs->have_pending_result = true;
+    uc->uc_mcontext->__ss.__pc += 4;
+    return 1;
+#else
+    (void) ctx;
+    return 0;
+#endif
 }
 
 void arm64_jit_set_saved_pc(addr_t pc) {
@@ -1360,14 +1502,16 @@ int arm64_jit_c_simd_ldst_imm_unsigned(struct arm64_jit_runtime *rt, addr_t gues
     bool is_load = (opc & 1) == 1;
     int rc = -1;
 
-    if (arm64_jit_trace_mode() && guest_pc == 0xefe62628) {
+    if (arm64_jit_trace_mode() &&
+            (guest_pc == 0xefe62628 || guest_pc == 0xefe72084 || guest_pc == 0xefe72094)) {
         fprintf(stderr,
-                "[arm64-jit] simd_ldst_uimm pc=0x%llx insn=0x%08x size=%u opc=%u imm12=%u rn=%u rt=%u addr=0x%llx is_load=%d x0=0x%llx v0=0x%016llx%016llx\n",
+                "[arm64-jit] simd_ldst_uimm pc=0x%llx insn=0x%08x size=%u opc=%u imm12=%u rn=%u rt=%u addr=0x%llx is_load=%d x0=0x%llx v%d=0x%016llx%016llx\n",
                 (unsigned long long) guest_pc, insn, size, opc, imm12, rn, rt_reg,
                 (unsigned long long) addr, is_load,
                 (unsigned long long) cpu->regs[0],
-                (unsigned long long) cpu->fp[0].d[1],
-                (unsigned long long) cpu->fp[0].d[0]);
+                rt_reg,
+                (unsigned long long) cpu->fp[rt_reg].d[1],
+                (unsigned long long) cpu->fp[rt_reg].d[0]);
     }
 
     if (is_load) {
@@ -2396,14 +2540,6 @@ static bool arm64_jit_cpu_equal(const struct cpu_state *a, const struct cpu_stat
     return true;
 }
 
-struct arm64_jit_verify_store_snapshot {
-    bool valid;
-    addr_t addr;
-    uint32_t size;
-    uint8_t before[8];
-    uint8_t after[8];
-};
-
 static bool arm64_jit_is_exclusive_store_insn(uint32_t insn) {
     return (((insn >> 24) & 0x3f) == 0x08) &&
             (((insn >> 12) & 0x7) == 0x7) &&
@@ -2653,7 +2789,19 @@ static int arm64_jit_run_block(struct arm64_jit_block *block, struct cpu_state *
     arm64_jit_set_saved_pc(block->start_pc);
     g_arm64_jit_runtime = &rt;
     in_jit = 1;
-    int interrupt = ((arm64_jit_entry_fn_t) block->code_rx)(&rt);
+    int interrupt;
+    struct arm64_jit_verify_state *vs = &g_arm64_jit_verify;
+    if (arm64_jit_verify_mode()) {
+        vs->trap_env_valid = true;
+        if (sigsetjmp(vs->trap_env, 1) == 0) {
+            interrupt = ((arm64_jit_entry_fn_t) block->code_rx)(&rt);
+        } else {
+            interrupt = rt.exit_interrupt;
+        }
+        vs->trap_env_valid = false;
+    } else {
+        interrupt = ((arm64_jit_entry_fn_t) block->code_rx)(&rt);
+    }
     in_jit = 0;
     g_arm64_jit_runtime = NULL;
 
@@ -2719,7 +2867,6 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb) {
         return cpu_run_to_interrupt_threaded(cpu, tlb);
 
     read_wrlock(&state->jetsam_lock);
-    static uint64_t verify_steps;
     while (true) {
         if (arm64_jit_trace_mode() && cpu->pc < 0x1000) {
             fprintf(stderr, "[arm64-jit] low-pc loop entry pc=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x30=0x%llx\n",
@@ -2751,63 +2898,44 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb) {
             return INT_GPF;
         }
 
-        struct cpu_state verify_expected_cpu;
-        struct tlb verify_expected_tlb;
-        addr_t verify_start_pc = cpu->pc;
-        struct arm64_jit_verify_store_snapshot verify_store_snapshot = {0};
-        if (arm64_jit_verify_mode()) {
-            verify_expected_cpu = *cpu;
-            verify_expected_tlb = *tlb;
-            if (block->insn_count > 0)
-                verify_store_snapshot = arm64_jit_verify_snapshot_store_before(cpu, tlb, block->insns[0]);
-            fprintf(stderr,
-                    "[arm64-jit-verify] enter step=%llu start_pc=0x%llx first_insn=0x%08x block_insns=%u\n",
-                    (unsigned long long) (verify_steps + 1),
-                    (unsigned long long) verify_start_pc,
-                    block->insn_count ? block->insns[0] : 0,
-                    block->insn_count);
-        }
-
         int interrupt = arm64_jit_run_block(block, cpu, tlb);
         if (arm64_jit_verify_mode()) {
-            arm64_jit_verify_snapshot_capture_after(&verify_store_snapshot, tlb);
-            arm64_jit_verify_snapshot_restore_before(&verify_store_snapshot, &verify_expected_tlb);
-            if (arm64_jit_trace_mode() && verify_start_pc == 0xefeb5034) {
-                fprintf(stderr,
-                        "[arm64-jit-verify] post-run start_pc=0x%llx x3=0x%llx nzcv=0x%x pc=0x%llx interrupt=%d\n",
-                        (unsigned long long) verify_start_pc,
-                        (unsigned long long) cpu->regs[3],
-                        cpu->nzcv,
-                        (unsigned long long) cpu->pc,
-                        interrupt);
-            }
-            verify_steps++;
-            int expected_interrupt = cpu_single_step_threaded_oracle(&verify_expected_cpu, &verify_expected_tlb);
-            int compare_interrupt = interrupt;
-            if (compare_interrupt == INT_BREAKPOINT || compare_interrupt == INT_NONE)
-                compare_interrupt = INT_NONE;
-            if (expected_interrupt == INT_DEBUG || expected_interrupt == INT_NONE)
-                expected_interrupt = INT_NONE;
-            arm64_jit_dump_verify_step(verify_steps, verify_start_pc,
-                    &verify_expected_cpu, cpu, expected_interrupt, compare_interrupt);
-            if (expected_interrupt != compare_interrupt ||
-                    !arm64_jit_cpu_equal(&verify_expected_cpu, cpu)) {
-                arm64_jit_verify_snapshot_restore_after(&verify_store_snapshot, tlb);
-                arm64_jit_dump_cpu_diff(&verify_expected_cpu, cpu, verify_start_pc,
-                        expected_interrupt, compare_interrupt);
+            struct arm64_jit_verify_state *vs = &g_arm64_jit_verify;
+            if (vs->failed) {
                 read_wrunlock(&state->jetsam_lock);
                 return INT_DEBUG;
             }
-            arm64_jit_verify_snapshot_restore_after(&verify_store_snapshot, tlb);
-            if (expected_interrupt != INT_NONE) {
-                read_wrunlock(&state->jetsam_lock);
-                return interrupt;
+            if (vs->have_pending_result) {
+                int expected_interrupt = vs->pending_interrupt;
+                int compare_interrupt = interrupt;
+                if (compare_interrupt == INT_DEBUG)
+                    compare_interrupt = INT_NONE;
+                if (expected_interrupt == INT_DEBUG)
+                    expected_interrupt = INT_NONE;
+                arm64_jit_dump_verify_step(vs->steps, vs->last_guest_pc,
+                        &vs->expected_cpu, cpu, expected_interrupt, compare_interrupt);
+                if (expected_interrupt != compare_interrupt ||
+                        !arm64_jit_cpu_equal(&vs->expected_cpu, cpu)) {
+                    arm64_jit_dump_cpu_diff(&vs->expected_cpu, cpu, vs->last_guest_pc,
+                            expected_interrupt, compare_interrupt);
+                    read_wrunlock(&state->jetsam_lock);
+                    return INT_DEBUG;
+                }
+                arm64_jit_verify_snapshot_restore_after(&vs->store_snap, tlb);
+                vs->have_pending_result = false;
             }
-            read_wrunlock(&state->jetsam_lock);
-            return INT_TIMER;
         }
         if (interrupt != INT_NONE) {
             cpu_log_interrupt_boundary("jit", cpu, interrupt);
+            if (arm64_jit_verify_mode()) {
+                struct arm64_jit_verify_state *vs = &g_arm64_jit_verify;
+                // The outer task loop owns real interrupt handling. After a
+                // matched interrupt boundary, resume verification from the
+                // post-handler architectural state on the next entry rather
+                // than comparing stale pre-handler oracle state.
+                vs->active = false;
+                vs->have_pending_result = false;
+            }
             read_wrunlock(&state->jetsam_lock);
             return interrupt;
         }

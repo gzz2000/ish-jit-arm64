@@ -13,6 +13,9 @@
 #include "emu/cpu.h"
 #include "emu/tlb.h"
 #include "xX_main_Xx.h"
+#if defined(GUEST_ARM64)
+#include "jit/guest-arm64/jit.h"
+#endif
 
 // Thread-local JIT recovery state (defined in asbestos.c)
 extern __thread volatile sig_atomic_t in_jit;
@@ -37,6 +40,8 @@ extern void jit_crash_trampoline(void);
 
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
 #if defined(__aarch64__) && defined(GUEST_ARM64)
+    if (sig == SIGTRAP && in_jit && arm64_jit_handle_verify_sigtrap(ctx))
+        return;
     // If we're inside JIT code and got SIGSEGV/SIGBUS, recover by redirecting
     // execution to jit_crash_trampoline via ucontext PC manipulation.
     // This avoids the overhead of _setjmp on every block entry.

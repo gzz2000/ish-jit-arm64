@@ -4,6 +4,7 @@
 #define ISH_JIT_GUEST_ARM64_JIT_H
 
 #include <signal.h>
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -23,6 +24,7 @@
 #define ARM64_JIT_MAX_FIXUPS 512
 #define ARM64_JIT_MAX_GPR_USES 6
 #define ARM64_JIT_MAX_ALLOCATABLE_GPRS 18
+#define ARM64_JIT_MAX_VERIFY_SITES ARM64_JIT_MAX_INSNS
 
 enum arm64_jit_host_role_reg {
     ARM64_JIT_HOST_CPU = 19,
@@ -79,6 +81,12 @@ struct arm64_jit_local_fixup {
     uint32_t kind;
 };
 
+struct arm64_jit_verify_site {
+    uint32_t host_offset;
+    addr_t guest_pc;
+    uint32_t insn;
+};
+
 struct arm64_jit_block;
 
 struct arm64_jit_page_bucket {
@@ -107,6 +115,8 @@ struct arm64_jit_block {
     uint32_t code_size;
     uint32_t pc_map_count;
     struct arm64_jit_pc_map pc_map[ARM64_JIT_MAX_PC_MAP];
+    uint32_t verify_site_count;
+    struct arm64_jit_verify_site verify_sites[ARM64_JIT_MAX_VERIFY_SITES];
     uint32_t fixup_count;
     struct arm64_jit_local_fixup fixups[ARM64_JIT_MAX_FIXUPS];
 };
@@ -166,6 +176,7 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb);
 
 int arm64_jit_trace_mode(void);
 int arm64_jit_verify_mode(void);
+int arm64_jit_handle_verify_sigtrap(void *ctx);
 void arm64_jit_set_saved_pc(addr_t pc);
 void arm64_jit_record_fault_pc(void *host_pc);
 

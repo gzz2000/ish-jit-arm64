@@ -25,6 +25,10 @@ uint32_t arm64_jit_enc_ret(unsigned rn) {
     return 0xd65f0000u | (rn << 5);
 }
 
+uint32_t arm64_jit_enc_brk(unsigned imm16) {
+    return 0xd4200000u | ((imm16 & 0xffff) << 5);
+}
+
 uint32_t arm64_jit_enc_ldr64_uimm(unsigned rt, unsigned rn, unsigned imm12) {
     return 0xf9400000u | ((imm12 & 0xfff) << 10) | ((rn & 0x1f) << 5) | (rt & 0x1f);
 }
@@ -80,6 +84,24 @@ void arm64_jit_record_pc_map(struct arm64_jit_emitter *e, addr_t guest_pc) {
         m->host_offset = (uint32_t) e->size;
         m->guest_pc = guest_pc;
     }
+}
+
+void arm64_jit_record_verify_site(struct arm64_jit_emitter *e, addr_t guest_pc, uint32_t insn) {
+    if (e->block->verify_site_count < ARM64_JIT_MAX_VERIFY_SITES) {
+        struct arm64_jit_verify_site *site =
+                &e->block->verify_sites[e->block->verify_site_count++];
+        site->host_offset = (uint32_t) e->size;
+        site->guest_pc = guest_pc;
+        site->insn = insn;
+    }
+}
+
+void arm64_jit_emit_verify_entry_brk(struct arm64_jit_emitter *e, addr_t guest_pc, uint32_t insn) {
+    if (!arm64_jit_verify_mode())
+        return;
+    arm64_jit_record_verify_site(e, guest_pc, insn);
+    arm64_jit_record_pc_map(e, guest_pc);
+    arm64_jit_emit32(e, arm64_jit_enc_brk(0x4a1));
 }
 
 bool arm64_jit_block_has_pc(const struct arm64_jit_block *block, addr_t guest_pc) {
@@ -1224,7 +1246,8 @@ static bool arm64_jit_emit_system_cached(struct arm64_jit_emitter *e, uint32_t i
 }
 
 enum arm64_jit_emit_result arm64_jit_emit_dp_imm(struct arm64_jit_emitter *e, uint32_t insn, addr_t guest_pc) {
-    arm64_jit_record_pc_map(e, guest_pc);
+    if (!arm64_jit_verify_mode())
+        arm64_jit_record_pc_map(e, guest_pc);
     if (arm64_jit_emit_move_wide_cached(e, insn))
         return ARM64_JIT_EMIT_CONTINUE;
     if (arm64_jit_emit_adr_cached(e, insn, guest_pc))
@@ -1235,16 +1258,13 @@ enum arm64_jit_emit_result arm64_jit_emit_dp_imm(struct arm64_jit_emitter *e, ui
         return ARM64_JIT_EMIT_CONTINUE;
     if (arm64_jit_emit_bitfield_cached(e, insn))
         return ARM64_JIT_EMIT_CONTINUE;
-    if (arm64_jit_verify_mode()) {
-        arm64_jit_emit_helper_return_regarg(e, arm64_jit_helper_exec_dp_imm_jitabi, guest_pc, insn);
-        return ARM64_JIT_EMIT_TERMINATE;
-    }
     arm64_jit_emit_helper_continue_regarg(e, arm64_jit_helper_exec_dp_imm_jitabi, guest_pc, insn);
     return ARM64_JIT_EMIT_CONTINUE;
 }
 
 enum arm64_jit_emit_result arm64_jit_emit_dp_reg(struct arm64_jit_emitter *e, uint32_t insn, addr_t guest_pc) {
-    arm64_jit_record_pc_map(e, guest_pc);
+    if (!arm64_jit_verify_mode())
+        arm64_jit_record_pc_map(e, guest_pc);
     if (arm64_jit_emit_logical_shifted_cached(e, insn))
         return ARM64_JIT_EMIT_CONTINUE;
     if (arm64_jit_emit_addsub_shifted_cached(e, insn))
@@ -1263,10 +1283,6 @@ enum arm64_jit_emit_result arm64_jit_emit_dp_reg(struct arm64_jit_emitter *e, ui
         return ARM64_JIT_EMIT_CONTINUE;
     if (arm64_jit_emit_dp_1src_cached(e, insn))
         return ARM64_JIT_EMIT_CONTINUE;
-    if (arm64_jit_verify_mode()) {
-        arm64_jit_emit_helper_return_regarg(e, arm64_jit_helper_exec_dp_reg_jitabi, guest_pc, insn);
-        return ARM64_JIT_EMIT_TERMINATE;
-    }
     arm64_jit_emit_helper_continue_regarg(e, arm64_jit_helper_exec_dp_reg_jitabi, guest_pc, insn);
     return ARM64_JIT_EMIT_CONTINUE;
 }
@@ -1275,9 +1291,10 @@ enum arm64_jit_emit_result arm64_jit_emit_branch(struct arm64_jit_emitter *e, ui
     uint32_t op = (insn >> 26) & 0x3f;
     if (op == 0x05 || op == 0x25) {
         addr_t target = guest_pc + arm64_branch_imm26(insn);
-        arm64_jit_record_pc_map(e, guest_pc);
+        if (!arm64_jit_verify_mode())
+            arm64_jit_record_pc_map(e, guest_pc);
         bool is_link = op == 0x25;
-        if (!arm64_jit_verify_mode() && !e->block->disable_local_fixups &&
+        if (!e->block->disable_local_fixups &&
                 !is_link && arm64_jit_block_has_pc(e->block, target)) {
             arm64_jit_emit_local_fixup(e, target, ARM64_JIT_FIXUP_B);
             arm64_jit_emit32(e, arm64_jit_enc_b_imm(0));
@@ -1292,12 +1309,17 @@ enum arm64_jit_emit_result arm64_jit_emit_branch(struct arm64_jit_emitter *e, ui
         return ARM64_JIT_EMIT_TERMINATE;
     }
     if ((insn & 0x7e000000u) == 0x34000000u) {
-        arm64_jit_record_pc_map(e, guest_pc);
-        if (!arm64_jit_verify_mode() && !e->block->disable_local_fixups) {
+        if (!arm64_jit_verify_mode())
+            arm64_jit_record_pc_map(e, guest_pc);
+        if (!e->block->disable_local_fixups) {
             addr_t target = guest_pc + arm64_branch_imm19(insn);
-            if (arm64_jit_block_has_pc(e->block, target)) {
+            uint32_t rt = ARM64_RT(insn);
+            int host_rt = arm64_jit_guest_src_host_reg(e->block, rt, false);
+            if (host_rt >= 0 && arm64_jit_block_has_pc(e->block, target)) {
+                bool sf = ((insn >> 31) & 1) != 0;
+                bool nonzero = ((insn >> 24) & 1) != 0;
                 arm64_jit_emit_local_fixup(e, target, ARM64_JIT_FIXUP_CBZ);
-                arm64_jit_emit32(e, insn);
+                arm64_jit_emit32(e, arm64_jit_enc_cbz_cbnz(sf, nonzero, (unsigned) host_rt, 0));
                 return ARM64_JIT_EMIT_CONTINUE;
             }
         }
@@ -1305,8 +1327,9 @@ enum arm64_jit_emit_result arm64_jit_emit_branch(struct arm64_jit_emitter *e, ui
         return ARM64_JIT_EMIT_TERMINATE;
     }
     if ((insn & 0xff000010u) == 0x54000000u) {
-        arm64_jit_record_pc_map(e, guest_pc);
-        if (!arm64_jit_verify_mode() && !e->block->disable_local_fixups) {
+        if (!arm64_jit_verify_mode())
+            arm64_jit_record_pc_map(e, guest_pc);
+        if (!e->block->disable_local_fixups) {
             addr_t target = guest_pc + arm64_branch_imm19(insn);
             if (arm64_jit_block_has_pc(e->block, target)) {
                 arm64_jit_emit_local_fixup(e, target, ARM64_JIT_FIXUP_B_COND);
@@ -1318,12 +1341,19 @@ enum arm64_jit_emit_result arm64_jit_emit_branch(struct arm64_jit_emitter *e, ui
         return ARM64_JIT_EMIT_TERMINATE;
     }
     if ((insn & 0x7e000000u) == 0x36000000u) {
-        arm64_jit_record_pc_map(e, guest_pc);
-        if (!arm64_jit_verify_mode() && !e->block->disable_local_fixups) {
+        if (!arm64_jit_verify_mode())
+            arm64_jit_record_pc_map(e, guest_pc);
+        if (!e->block->disable_local_fixups) {
             addr_t target = guest_pc + arm64_branch_imm14(insn);
-            if (arm64_jit_block_has_pc(e->block, target)) {
+            uint32_t rt = ARM64_RT(insn);
+            int host_rt = arm64_jit_guest_src_host_reg(e->block, rt, false);
+            if (host_rt >= 0 && arm64_jit_block_has_pc(e->block, target)) {
+                bool b5 = ((insn >> 31) & 1) != 0;
+                bool nonzero = ((insn >> 24) & 1) != 0;
+                unsigned bit40 = (insn >> 19) & 0x1f;
                 arm64_jit_emit_local_fixup(e, target, ARM64_JIT_FIXUP_TBZ);
-                arm64_jit_emit32(e, insn);
+                arm64_jit_emit32(e, arm64_jit_enc_tbz_tbnz(b5, nonzero, bit40,
+                        (unsigned) host_rt, 0));
                 return ARM64_JIT_EMIT_CONTINUE;
             }
         }
@@ -1331,7 +1361,8 @@ enum arm64_jit_emit_result arm64_jit_emit_branch(struct arm64_jit_emitter *e, ui
         return ARM64_JIT_EMIT_TERMINATE;
     }
     if ((insn & 0xfe000000u) == 0xd6000000u) {
-        arm64_jit_record_pc_map(e, guest_pc);
+        if (!arm64_jit_verify_mode())
+            arm64_jit_record_pc_map(e, guest_pc);
         arm64_jit_emit_helper_return_regarg(e, arm64_jit_helper_branch_reg_jitabi, guest_pc, insn);
         return ARM64_JIT_EMIT_TERMINATE;
     }
@@ -1340,13 +1371,15 @@ enum arm64_jit_emit_result arm64_jit_emit_branch(struct arm64_jit_emitter *e, ui
 
 enum arm64_jit_emit_result arm64_jit_emit_exception(struct arm64_jit_emitter *e, uint32_t insn, addr_t guest_pc) {
     (void) insn;
-    arm64_jit_record_pc_map(e, guest_pc);
+    if (!arm64_jit_verify_mode())
+        arm64_jit_record_pc_map(e, guest_pc);
     arm64_jit_emit_helper_return(e, arm64_jit_helper_syscall_jitabi, guest_pc);
     return ARM64_JIT_EMIT_TERMINATE;
 }
 
 enum arm64_jit_emit_result arm64_jit_emit_system(struct arm64_jit_emitter *e, uint32_t insn, addr_t guest_pc) {
-    arm64_jit_record_pc_map(e, guest_pc);
+    if (!arm64_jit_verify_mode())
+        arm64_jit_record_pc_map(e, guest_pc);
     if (arm64_jit_emit_system_cached(e, insn)) {
         if (arm64_jit_trace_mode() && guest_pc == 0xefe62638) {
             uint32_t rd = ARM64_RD(insn);
@@ -1358,26 +1391,14 @@ enum arm64_jit_emit_result arm64_jit_emit_system(struct arm64_jit_emitter *e, ui
     }
 
     if ((insn & 0xffffffe0U) == 0xd53bd040U) { // mrs xt, tpidr_el0
-        if (arm64_jit_verify_mode()) {
-            arm64_jit_emit_helper_return_regarg(e, arm64_jit_helper_mrs_tpidr_jitabi, guest_pc, ARM64_RD(insn));
-            return ARM64_JIT_EMIT_TERMINATE;
-        }
         arm64_jit_emit_helper_continue_regarg(e, arm64_jit_helper_mrs_tpidr_jitabi, guest_pc, ARM64_RD(insn));
         return ARM64_JIT_EMIT_CONTINUE;
     }
     if ((insn & 0xffffffe0U) == 0xd51bd040U) { // msr tpidr_el0, xt
-        if (arm64_jit_verify_mode()) {
-            arm64_jit_emit_helper_return_regarg(e, arm64_jit_helper_msr_tpidr_jitabi, guest_pc, ARM64_RT(insn));
-            return ARM64_JIT_EMIT_TERMINATE;
-        }
         arm64_jit_emit_helper_continue_regarg(e, arm64_jit_helper_msr_tpidr_jitabi, guest_pc, ARM64_RT(insn));
         return ARM64_JIT_EMIT_CONTINUE;
     }
     if ((insn & 0xfffffff0U) == 0xd50340d0U || (insn & 0xfffffff0U) == 0xd50341d0U) { // msr daifset/clr
-        if (arm64_jit_verify_mode()) {
-            arm64_jit_emit_helper_return_regarg(e, arm64_jit_helper_msr_daif_jitabi, guest_pc, 0);
-            return ARM64_JIT_EMIT_TERMINATE;
-        }
         arm64_jit_emit_helper_continue_regarg(e, arm64_jit_helper_msr_daif_jitabi, guest_pc, 0);
         return ARM64_JIT_EMIT_CONTINUE;
     }
@@ -1424,10 +1445,6 @@ enum arm64_jit_emit_result arm64_jit_emit_system(struct arm64_jit_emitter *e, ui
             uint64_t packed = (uint32_t) guest_pc |
                     ((uint64_t) ARM64_RD(insn) << 32) |
                     ((uint64_t) (unsigned) sysreg_id << 40);
-            if (arm64_jit_verify_mode()) {
-                arm64_jit_emit_helper_return_packed1(e, arm64_jit_helper_mrs_sysreg_jitabi, packed);
-                return ARM64_JIT_EMIT_TERMINATE;
-            }
             arm64_jit_emit_helper_continue_packed1(e, arm64_jit_helper_mrs_sysreg_jitabi, packed);
             return ARM64_JIT_EMIT_CONTINUE;
         }
@@ -1438,7 +1455,8 @@ enum arm64_jit_emit_result arm64_jit_emit_system(struct arm64_jit_emitter *e, ui
 }
 
 enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uint32_t insn, addr_t guest_pc) {
-    arm64_jit_record_pc_map(e, guest_pc);
+    if (!arm64_jit_verify_mode())
+        arm64_jit_record_pc_map(e, guest_pc);
 
     if (((insn >> 24) & 0x3f) == 0x08 &&
             ((insn >> 12) & 0x7) == 0x7 &&
@@ -1532,10 +1550,6 @@ enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uin
         return ARM64_JIT_EMIT_CONTINUE;
     }
     if ((insn & 0x3b200000u) == 0x38000000u) {
-        if (arm64_jit_verify_mode()) {
-            arm64_jit_emit_helper_return_regarg(e, arm64_jit_helper_ldst_imm9_jitabi, guest_pc, insn);
-            return ARM64_JIT_EMIT_TERMINATE;
-        }
         uint32_t opc9 = (insn >> 22) & 0x3;
         uint32_t mode9 = (insn >> 10) & 0x3;
         uint32_t rn9 = ARM64_RN(insn);
@@ -1638,10 +1652,6 @@ enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uin
                 return ARM64_JIT_EMIT_CONTINUE;
             }
         }
-        if (arm64_jit_verify_mode()) {
-            arm64_jit_emit_helper_return_regarg(e, arm64_jit_helper_ldst_regoff_jitabi, guest_pc, insn);
-            return ARM64_JIT_EMIT_TERMINATE;
-        }
         arm64_jit_emit_helper_continue_regarg(e, arm64_jit_helper_ldst_regoff_jitabi, guest_pc, insn);
         return ARM64_JIT_EMIT_CONTINUE;
     }
@@ -1658,34 +1668,11 @@ enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uin
     uint32_t rt = ARM64_RT(insn);
     uint32_t imm12 = (insn >> 10) & 0xfff;
 
-    if (V && (insn & 0x3b000000u) == 0x39000000u) {
+    if (V && ((insn & 0x3b000000u) == 0x39000000u ||
+              (insn & 0x3b000000u) == 0x38000000u)) {
         if (arm64_jit_trace_mode() && (guest_pc == 0xefe62688 || guest_pc == 0xefe6268c)) {
             fprintf(stderr, "[arm64-jit] emit_ld_st simd_uimm pc=0x%llx insn=0x%08x\n",
                     (unsigned long long) guest_pc, insn);
-        }
-        int base_host = arm64_jit_guest_src_host_reg(e->block, rn, true);
-        if (base_host >= 0) {
-            uint64_t offset = (uint64_t) imm12 << size;
-            if (base_host != ARM64_JIT_HOST_TMP2)
-                arm64_jit_emit32(e, arm64_jit_enc_mov_reg(ARM64_JIT_HOST_TMP2, (unsigned) base_host));
-            if (offset != 0) {
-                if (offset <= 4095) {
-                    arm64_jit_emit32(e, 0x91000000u |
-                            (((uint32_t) offset & 0xfff) << 10) |
-                            ((ARM64_JIT_HOST_TMP2 & 0x1f) << 5) |
-                            (ARM64_JIT_HOST_TMP2 & 0x1f));
-                } else {
-                    arm64_jit_emit_load_imm64(e, ARM64_JIT_HOST_TMP1, offset);
-                    arm64_jit_emit32(e, 0x8b010042u); // add x2, x2, x1
-                }
-            }
-            arm64_jit_emit_helper_continue_live_addronly(e, arm64_jit_helper_simd_ldst_imm_unsigned_live,
-                    ((uint64_t) (uint32_t) guest_pc << 32) | insn, ARM64_JIT_HOST_TMP2);
-            return ARM64_JIT_EMIT_CONTINUE;
-        }
-        if (arm64_jit_verify_mode()) {
-            arm64_jit_emit_helper_return_regarg(e, arm64_jit_helper_simd_ldst_imm_unsigned_jitabi, guest_pc, insn);
-            return ARM64_JIT_EMIT_TERMINATE;
         }
         arm64_jit_emit_helper_continue_regarg(e, arm64_jit_helper_simd_ldst_imm_unsigned_jitabi, guest_pc, insn);
         return ARM64_JIT_EMIT_CONTINUE;
@@ -1702,11 +1689,6 @@ enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uin
                     ((uint64_t) (imm12 & 0xfff) << 12) |
                     ((uint64_t) (load_mode & 0x3) << 24);
             uint64_t packed1_live = ((uint64_t) (uint32_t) guest_pc << 32) | packed1;
-            if (arm64_jit_verify_mode()) {
-                arm64_jit_emit_helper_return_packed2(e, arm64_jit_helper_ldr_imm_unsigned_jitabi,
-                        guest_pc, packed1);
-                return ARM64_JIT_EMIT_TERMINATE;
-            }
             int base_host = arm64_jit_guest_src_host_reg(e->block, rn, true);
             int dst_host = arm64_jit_host_reg_for_guest(e->block, rt);
             if (base_host >= 0) {
@@ -1738,10 +1720,6 @@ enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uin
                     ((uint64_t) (rn & 0x1f) << 37) |
                     ((uint64_t) (size & 0x3) << 42) |
                     ((uint64_t) (imm12 & 0xfff) << 44);
-            if (arm64_jit_verify_mode()) {
-                arm64_jit_emit_helper_return_packed1(e, arm64_jit_helper_str_imm_unsigned_jitabi, packed);
-                return ARM64_JIT_EMIT_TERMINATE;
-            }
             int base_host = arm64_jit_guest_src_host_reg(e->block, rn, true);
             int value_host = arm64_jit_guest_src_host_reg_or_zr(e->block, rt);
             if (base_host >= 0 && value_host >= 0) {
@@ -1833,6 +1811,7 @@ retry_without_local_fixups:
     block->spill_state_fn = NULL;
     block->reload_state_fn = NULL;
     block->pc_map_count = 0;
+    block->verify_site_count = 0;
     block->fixup_count = 0;
 
     arm64_jit_emit_prologue(&e);
@@ -1841,6 +1820,7 @@ retry_without_local_fixups:
     for (uint32_t i = 0; i < block->insn_count; i++) {
         addr_t guest_pc = block->insn_pcs[i];
         uint32_t insn = block->insns[i];
+        arm64_jit_emit_verify_entry_brk(&e, guest_pc, insn);
         const struct arm64_jit_insn_info *info = &block->infos[i];
         enum arm64_jit_emit_result res = arm64_jit_emit_one(&e, info, insn, guest_pc);
         if (res == ARM64_JIT_EMIT_UNSUPPORTED) {
@@ -1849,12 +1829,6 @@ retry_without_local_fixups:
             break;
         }
         if (res == ARM64_JIT_EMIT_TERMINATE) {
-            terminated = true;
-            break;
-        }
-        if (arm64_jit_verify_mode()) {
-            arm64_jit_emit_spill_cached_state(&e);
-            arm64_jit_emit_helper_return(&e, arm64_jit_helper_verify_trap_jitabi, guest_pc + 4);
             terminated = true;
             break;
         }
