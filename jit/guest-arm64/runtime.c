@@ -28,6 +28,7 @@ struct arm64_jit_verify_state {
     bool trap_env_valid;
     uint64_t steps;
     addr_t last_guest_pc;
+    uint32_t last_insn;
     int pending_interrupt;
     sigjmp_buf trap_env;
 };
@@ -49,6 +50,7 @@ static void arm64_jit_dump_cpu_diff(const struct cpu_state *expected, const stru
 static void arm64_jit_dump_verify_step(uint64_t step, addr_t start_pc,
         const struct cpu_state *expected, const struct cpu_state *actual,
         int expected_interrupt, int actual_interrupt);
+static void arm64_jit_dump_guest_window(struct tlb *tlb, addr_t guest_pc);
 static struct arm64_jit_verify_store_snapshot arm64_jit_verify_snapshot_store_before(
         struct cpu_state *cpu, struct tlb *tlb, uint32_t insn);
 static void arm64_jit_verify_snapshot_capture_after(struct arm64_jit_verify_store_snapshot *snap,
@@ -182,6 +184,11 @@ int arm64_jit_handle_verify_sigtrap(void *ctx) {
     if (!arm64_jit_cpu_equal(&vs->expected_cpu, &actual_cpu)) {
         arm64_jit_dump_cpu_diff(&vs->expected_cpu, &actual_cpu, site->guest_pc,
                 INT_NONE, INT_NONE);
+        fprintf(stderr, "  trapped insn=0x%08x prev_pc=0x%llx prev_insn=0x%08x\n",
+                site->insn,
+                (unsigned long long) vs->last_guest_pc,
+                vs->last_insn);
+        arm64_jit_dump_guest_window(g_arm64_jit_runtime->tlb, site->guest_pc);
         vs->failed = true;
         g_arm64_jit_runtime->resume_pc = site->guest_pc;
         g_arm64_jit_runtime->cpu->pc = site->guest_pc;
@@ -196,6 +203,7 @@ int arm64_jit_handle_verify_sigtrap(void *ctx) {
     arm64_jit_verify_snapshot_restore_before(&vs->store_snap, &vs->expected_tlb);
     vs->steps++;
     vs->last_guest_pc = site->guest_pc;
+    vs->last_insn = site->insn;
     vs->pending_interrupt = expected_interrupt;
     vs->have_pending_result = true;
     uc->uc_mcontext->__ss.__pc += 4;
@@ -758,7 +766,7 @@ int arm64_jit_helper_exec_dp_imm(struct arm64_jit_runtime *rt, addr_t guest_pc, 
         uint32_t rn = ARM64_RN(insn);
         uint32_t rd = ARM64_RD(insn);
         bool ok = false;
-        uint64_t lhs = arm64_jit_read_gpr(cpu, rn, false);
+        uint64_t lhs = arm64_jit_read_gpr(cpu, rn, true);
         uint64_t mask = arm64_jit_decode_bitmask(n, imms, immr, sf, &ok);
         if (!ok)
             return arm64_jit_helper_unsupported(rt, guest_pc);
@@ -1059,7 +1067,10 @@ int arm64_jit_helper_exec_dp_reg(struct arm64_jit_runtime *rt, addr_t guest_pc, 
         uint32_t imm3 = (insn >> 10) & 0x7;
         uint32_t rn = ARM64_RN(insn);
         uint32_t rd = ARM64_RD(insn);
-        uint64_t lhs = arm64_jit_read_gpr(cpu, rn, !setflags);
+        bool rn_is_sp = !setflags;
+        if ((option & 0x3) == 3)
+            rn_is_sp = true;
+        uint64_t lhs = arm64_jit_read_gpr(cpu, rn, rn_is_sp);
         uint64_t rhs = arm64_jit_extend_reg_value(arm64_jit_read_gpr(cpu, rm, false), option);
         rhs <<= imm3;
         if (!sf)
@@ -1071,10 +1082,7 @@ int arm64_jit_helper_exec_dp_reg(struct arm64_jit_runtime *rt, addr_t guest_pc, 
             else
                 arm64_jit_nzcv_from_add(cpu, lhs, rhs, res, sf);
         }
-        if (rd == 31 && !setflags)
-            cpu->sp = sf ? res : (uint32_t) res;
-        else
-            arm64_jit_write_gpr(cpu, rd, res, sf);
+        arm64_jit_write_gpr(cpu, rd, res, sf);
         rt->resume_pc = guest_pc + 4;
         cpu->pc = guest_pc + 4;
         rt->exit_interrupt = INT_NONE;
@@ -1100,17 +1108,6 @@ int arm64_jit_helper_exec_dp_reg(struct arm64_jit_runtime *rt, addr_t guest_pc, 
         else
             return arm64_jit_helper_unsupported(rt, guest_pc);
         uint64_t res = is_sub ? (lhs - rhs) : (lhs + rhs);
-        if (arm64_jit_trace_mode() && (guest_pc == 0xefeb6384 || guest_pc == 0xefeb39e4)) {
-            fprintf(stderr,
-                    "[arm64-jit] dp_reg_shift pc=0x%llx rn=%u rd=%u rm=%u lhs=0x%llx rhs=0x%llx res=0x%llx setflags=%d sf=%d sp=0x%llx x2=0x%llx x6=0x%llx x9=0x%llx x10=0x%llx\n",
-                    (unsigned long long) guest_pc, rn, rd, rm,
-                    (unsigned long long) lhs, (unsigned long long) rhs,
-                    (unsigned long long) res, setflags, sf,
-                    (unsigned long long) cpu->sp, (unsigned long long) cpu->regs[2],
-                    (unsigned long long) cpu->regs[6],
-                    (unsigned long long) cpu->regs[9],
-                    (unsigned long long) cpu->regs[10]);
-        }
         if (setflags) {
             if (is_sub)
                 arm64_jit_nzcv_from_sub(cpu, lhs, rhs, res, sf);
@@ -2713,6 +2710,55 @@ static void arm64_jit_dump_cpu_diff(const struct cpu_state *expected, const stru
     }
 }
 
+static void arm64_jit_dump_block_window(const struct arm64_jit_block *block, addr_t guest_pc) {
+    if (block == NULL)
+        return;
+    int idx = -1;
+    for (uint32_t i = 0; i < block->insn_count; i++) {
+        if (block->insn_pcs[i] == guest_pc) {
+            idx = (int) i;
+            break;
+        }
+    }
+    if (idx < 0)
+        return;
+    int lo = idx - 3;
+    int hi = idx + 3;
+    if (lo < 0)
+        lo = 0;
+    if (hi >= (int) block->insn_count)
+        hi = (int) block->insn_count - 1;
+    fprintf(stderr,
+            "  block start=0x%llx end=0x%llx insns=%u window=%d..%d\n",
+            (unsigned long long) block->start_pc,
+            (unsigned long long) block->end_pc,
+            block->insn_count, lo, hi);
+    for (int i = lo; i <= hi; i++) {
+        fprintf(stderr, "  %c pc=0x%llx insn=0x%08x\n",
+                i == idx ? '>' : ' ',
+                (unsigned long long) block->insn_pcs[i],
+                block->insns[i]);
+    }
+}
+
+static void arm64_jit_dump_guest_window(struct tlb *tlb, addr_t guest_pc) {
+    fprintf(stderr, "  guest window around 0x%llx\n", (unsigned long long) guest_pc);
+    for (int i = -3; i <= 3; i++) {
+        addr_t pc = guest_pc + (addr_t) (i * 4);
+        uint32_t insn = 0;
+        addr_t tmp = pc;
+        if (!arm64_read_insn(&tmp, tlb, &insn)) {
+            fprintf(stderr, "  %c pc=0x%llx unreadable\n",
+                    i == 0 ? '>' : ' ',
+                    (unsigned long long) pc);
+            continue;
+        }
+        fprintf(stderr, "  %c pc=0x%llx insn=0x%08x\n",
+                i == 0 ? '>' : ' ',
+                (unsigned long long) pc, insn);
+    }
+}
+
 static int arm64_jit_run_block(struct arm64_jit_block *block, struct cpu_state *cpu, struct tlb *tlb) {
     struct arm64_jit_runtime rt = {
         .cpu = cpu,
@@ -2847,6 +2893,7 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb) {
                         !arm64_jit_cpu_equal(&vs->expected_cpu, cpu)) {
                     arm64_jit_dump_cpu_diff(&vs->expected_cpu, cpu, vs->last_guest_pc,
                             expected_interrupt, compare_interrupt);
+                    fprintf(stderr, "  trapped insn=0x%08x\n", vs->last_insn);
                     read_wrunlock(&state->jetsam_lock);
                     return INT_DEBUG;
                 }

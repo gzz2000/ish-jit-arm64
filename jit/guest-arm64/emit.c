@@ -660,6 +660,13 @@ static bool arm64_jit_emit_simd_fp_cached(struct arm64_jit_emitter *e, uint32_t 
         arm64_jit_emit32(e, insn);
         return true;
     }
+    if ((insn & 0xff80fc00u) == 0x0f000400u || // MOVI .4H / .2S
+            (insn & 0xff80fc00u) == 0x4f000400u || // MOVI .8H / .4S
+            (insn & 0xff80fc00u) == 0x0f00e400u || // MOVI .8B
+            (insn & 0xff80fc00u) == 0x4f00e400u) { // MOVI .16B
+        arm64_jit_emit32(e, insn);
+        return true;
+    }
     if ((insn & 0xbfe0fc00u) == 0x0e000c00u) { // DUP (general) - GPR to vector
         uint32_t rn = ARM64_RN(insn);
         int src = arm64_jit_guest_src_host_reg_or_zr(e->block, rn);
@@ -907,8 +914,8 @@ static bool arm64_jit_emit_logical_shifted_cached(struct arm64_jit_emitter *e, u
     uint32_t rn = ARM64_RN(insn);
     uint32_t rm = ARM64_RM(insn);
     int dst = arm64_jit_guest_src_host_reg_or_zr(e->block, rd);
-    int src1 = arm64_jit_guest_src_host_reg(e->block, rn, false);
-    int src2 = arm64_jit_guest_src_host_reg(e->block, rm, false);
+    int src1 = arm64_jit_guest_src_host_reg_or_zr(e->block, rn);
+    int src2 = arm64_jit_guest_src_host_reg_or_zr(e->block, rm);
     if (dst < 0 || src1 < 0 || src2 < 0)
         return false;
 
@@ -934,11 +941,9 @@ static bool arm64_jit_emit_addsub_shifted_cached(struct arm64_jit_emitter *e, ui
     uint32_t rd = ARM64_RD(insn);
     uint32_t rn = ARM64_RN(insn);
     uint32_t rm = ARM64_RM(insn);
-    bool setflags = ((insn >> 29) & 1) != 0;
-    int dst = setflags ? arm64_jit_guest_src_host_reg_or_zr(e->block, rd)
-                       : arm64_jit_guest_src_host_reg(e->block, rd, false);
-    int src1 = arm64_jit_guest_src_host_reg(e->block, rn, false);
-    int src2 = arm64_jit_guest_src_host_reg(e->block, rm, false);
+    int dst = arm64_jit_guest_src_host_reg_or_zr(e->block, rd);
+    int src1 = arm64_jit_guest_src_host_reg_or_zr(e->block, rn);
+    int src2 = arm64_jit_guest_src_host_reg_or_zr(e->block, rm);
     if (dst < 0 || src1 < 0 || src2 < 0)
         return false;
 
@@ -1034,13 +1039,17 @@ static bool arm64_jit_emit_addsub_extended_cached(struct arm64_jit_emitter *e, u
     if ((insn & 0x1f200000u) != 0x0b200000u)
         return false;
     bool setflags = ((insn >> 29) & 1) != 0;
+    uint32_t option = (insn >> 13) & 0x7;
 
     uint32_t rd = ARM64_RD(insn);
     uint32_t rn = ARM64_RN(insn);
     uint32_t rm = ARM64_RM(insn);
     int dst = setflags ? arm64_jit_guest_src_host_reg_or_zr(e->block, rd)
                        : ((rd == 31) ? ARM64_JIT_HOST_GUEST_SP : arm64_jit_host_reg_for_guest(e->block, rd));
-    int src1 = arm64_jit_guest_src_host_reg(e->block, rn, !setflags);
+    bool rn_is_sp = !setflags;
+    if ((option & 0x3) == 3)
+        rn_is_sp = true;
+    int src1 = arm64_jit_guest_src_host_reg(e->block, rn, rn_is_sp);
     int src2 = arm64_jit_guest_src_host_reg_or_zr(e->block, rm);
     if (dst < 0 || src1 < 0 || src2 < 0)
         return false;
@@ -1090,8 +1099,8 @@ static bool arm64_jit_emit_adc_cached(struct arm64_jit_emitter *e, uint32_t insn
     uint32_t rn = ARM64_RN(insn);
     uint32_t rm = ARM64_RM(insn);
     int dst = arm64_jit_guest_src_host_reg_or_zr(e->block, rd);
-    int src1 = arm64_jit_guest_src_host_reg(e->block, rn, false);
-    int src2 = arm64_jit_guest_src_host_reg(e->block, rm, false);
+    int src1 = arm64_jit_guest_src_host_reg_or_zr(e->block, rn);
+    int src2 = arm64_jit_guest_src_host_reg_or_zr(e->block, rm);
     if (dst < 0 || src1 < 0 || src2 < 0)
         return false;
 
@@ -1274,12 +1283,15 @@ enum arm64_jit_emit_result arm64_jit_emit_dp_imm(struct arm64_jit_emitter *e, ui
 }
 
 enum arm64_jit_emit_result arm64_jit_emit_dp_reg(struct arm64_jit_emitter *e, uint32_t insn, addr_t guest_pc) {
-    if (arm64_jit_emit_logical_shifted_cached(e, insn))
+    if (arm64_jit_emit_logical_shifted_cached(e, insn)) {
         return ARM64_JIT_EMIT_CONTINUE;
-    if (arm64_jit_emit_addsub_shifted_cached(e, insn))
+    }
+    if (arm64_jit_emit_addsub_extended_cached(e, insn)) {
         return ARM64_JIT_EMIT_CONTINUE;
-    if (arm64_jit_emit_addsub_extended_cached(e, insn))
+    }
+    if (arm64_jit_emit_addsub_shifted_cached(e, insn)) {
         return ARM64_JIT_EMIT_CONTINUE;
+    }
     if (arm64_jit_emit_dp_3src_cached(e, insn))
         return ARM64_JIT_EMIT_CONTINUE;
     if (arm64_jit_emit_csel_cached(e, insn))
