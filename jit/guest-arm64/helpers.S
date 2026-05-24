@@ -83,6 +83,35 @@
 
 .extern _g_arm64_jit_tlb_profile
 
+.macro JIT_TLB_LOOKUP_READ_HIT guest_addr, out_reg, scratch0, scratch1, miss_label
+    eor \scratch0, \guest_addr, \guest_addr, lsr #13
+    lsr \scratch0, \scratch0, #12
+    and \scratch0, \scratch0, #0x1fff
+    add \out_reg, x20, #32
+    add \out_reg, \out_reg, \scratch0, lsl #5
+    and \scratch1, \guest_addr, #0xfffffffffffff000
+    ldr \scratch0, [\out_reg]
+    eor \scratch0, \scratch0, \scratch1
+    cbnz \scratch0, \miss_label
+    ldr \scratch0, [\out_reg, #16]
+    add \out_reg, \scratch0, \scratch1
+.endm
+
+.macro JIT_TLB_LOOKUP_WRITE_HIT guest_addr, out_reg, scratch0, scratch1, miss_label
+    eor \scratch0, \guest_addr, \guest_addr, lsr #13
+    lsr \scratch0, \scratch0, #12
+    and \scratch0, \scratch0, #0x1fff
+    add \out_reg, x20, #32
+    add \out_reg, \out_reg, \scratch0, lsl #5
+    and \scratch1, \guest_addr, #0xfffffffffffff000
+    ldr \scratch0, [\out_reg, #8]
+    eor \scratch0, \scratch0, \scratch1
+    cbnz \scratch0, \miss_label
+    str \scratch1, [x20, #8]
+    ldr \scratch0, [\out_reg, #16]
+    add \out_reg, \scratch0, \scratch1
+.endm
+
 .macro JITABI_WRAP1 name, target
 .globl \name
 \name:
@@ -826,6 +855,81 @@ _arm64_jit_helper_ldr_imm_unsigned:
 .globl _arm64_jit_helper_ldr_imm_unsigned_live
 _arm64_jit_helper_ldr_imm_unsigned_live:
     // x0 = rt*, x1 = packed1, x2 = guest_addr, x3 = store_in_x1
+    ubfx x17, x1, #24, #2          // load_mode
+    mov x16, #3
+    eor x16, x17, x16
+    cbz x16, .Lldr_uimm_cold
+    mov x16, #2
+    eor x16, x17, x16
+    cbnz x16, 0f
+    ubfx x16, x1, #10, #2          // size_shift
+    mov x17, #2
+    eor x17, x16, x17
+    cbnz x17, .Lldr_uimm_cold
+0:
+    ubfx x16, x1, #10, #2          // size_shift
+    and x17, x2, #0xfff
+    mov x0, #1
+    lsl x0, x0, x16
+    sub x0, x0, #1
+    add x17, x17, x0
+    lsr x0, x17, #12
+    cbnz x0, .Lldr_uimm_cold
+
+    JIT_TLB_LOOKUP_READ_HIT x2, x0, x16, x17, .Lldr_uimm_cold
+    and x16, x2, #0xfff
+    add x16, x0, x16               // host ptr
+
+    ubfx x17, x1, #24, #2          // load_mode
+    mov x0, #2
+    eor x0, x17, x0
+    cbz x0, 8f                     // LDRSW
+    ubfx x17, x1, #10, #2          // size_shift
+    mov x0, #3
+    eor x0, x17, x0
+    cbz x0, 1f
+    mov x0, #2
+    eor x0, x17, x0
+    cbz x0, 2f
+    mov x0, #1
+    eor x0, x17, x0
+    cbz x0, 3f
+    ldrb w0, [x16]
+    b 4f
+1:
+    ldr x0, [x16]
+    b 4f
+2:
+    ldr w0, [x16]
+    b 4f
+3:
+    ldrh w0, [x16]
+    b 4f
+8:
+    ldr w0, [x16]
+    sxtw x0, w0
+4:
+    lsr x16, x1, #32               // guest_pc
+    cbnz x3, 5f
+    ubfx x17, x1, #0, #5           // rt
+    mov x1, #31
+    eor x1, x17, x1
+    cbz x1, 6f
+    ldr x1, [x21, #0]              // cpu*
+    add x1, x1, #16
+    str x0, [x1, x17, lsl #3]
+    b 6f
+5:
+    mov x1, x0
+6:
+    add x16, x16, #4
+    str x16, [x21, #40]            // rt->resume_pc
+    ldr x17, [x21, #0]             // cpu*
+    str x16, [x17, #272]           // cpu->pc
+    mov x0, #-1                    // INT_NONE
+    ret
+
+.Lldr_uimm_cold:
     stp x29, x30, [sp, #-80]!
     stp x16, x17, [sp, #16]
     stp x1, x3, [sp, #48]          // packed1, store_in_x1
@@ -1074,6 +1178,49 @@ _arm64_jit_helper_str_imm_unsigned_live:
     // Fast path mirrors _arm64_jit_helper_str_imm_unsigned, but uses live
     // register values directly and only materializes through ctx-provided
     // snippets on fallback.
+    ubfx x16, x1, #42, #2          // size_shift
+    and x17, x2, #0xfff
+    mov x0, #1
+    lsl x0, x0, x16
+    sub x0, x0, #1
+    add x17, x17, x0
+    lsr x0, x17, #12
+    cbnz x0, .Lstr_uimm_cold
+
+    JIT_TLB_LOOKUP_WRITE_HIT x2, x0, x16, x17, .Lstr_uimm_cold
+    and x16, x2, #0xfff
+    add x16, x0, x16               // host ptr
+
+    ubfx x17, x1, #42, #2          // size_shift
+    mov x0, #3
+    eor x0, x17, x0
+    cbz x0, 11f
+    mov x0, #2
+    eor x0, x17, x0
+    cbz x0, 12f
+    mov x0, #1
+    eor x0, x17, x0
+    cbz x0, 13f
+    strb w3, [x16]
+    b 14f
+11:
+    str x3, [x16]
+    b 14f
+12:
+    str w3, [x16]
+    b 14f
+13:
+    strh w3, [x16]
+14:
+    uxtw x16, w1                   // guest_pc low 32
+    add x16, x16, #4
+    str x16, [x21, #40]            // rt->resume_pc
+    ldr x17, [x21, #0]             // cpu*
+    str x16, [x17, #272]           // cpu->pc
+    mov x0, #-1                    // INT_NONE
+    ret
+
+.Lstr_uimm_cold:
     stp x29, x30, [sp, #-80]!
     stp x16, x17, [sp, #16]
     stp x1, x3, [sp, #48]          // packed, store value
@@ -1363,73 +1510,79 @@ _arm64_jit_helper_simd_ldst_imm_unsigned_live:
     // Live-cache path for plain SIMD unsigned-immediate load/store:
     // uses live guest address, keeps GPR cache intact on fast success,
     // still uses cpu->fp[] as the vector backing store.
-    stp x29, x30, [sp, #-112]!
+    stp x29, x30, [sp, #-176]!
     stp x16, x17, [sp, #16]
     stp x4, x5, [sp, #32]
     stp x6, x7, [sp, #48]
     stp x8, x9, [sp, #64]
-    stp x0, x1, [sp, #80]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x0, x1, [sp, #128]
     mrs x16, nzcv
-    str x16, [sp, #96]
+    str x16, [sp, #144]
 
-    ldr w16, [sp, #88]             // insn low 32
+    ldr w16, [sp, #136]            // insn low 32
     ubfx x17, x16, #30, #2         // size
-    ubfx x4, x16, #22, #2          // opc
+    ubfx x0, x16, #22, #2          // opc
     cmp x17, #0
     b.ne 0f
-    tst x4, #0x2
+    tst x0, #0x2
     b.eq 0f                        // Bt
     mov x3, #16                    // Qt width
     b 1f
 0:
-    cmp x4, #0x2
+    cmp x0, #0x2
     b.hs 90f
     mov x3, #1
     lsl x3, x3, x17               // 1/2/4/8
 1:
-    and x4, x2, #0xfff
-    sub x5, x3, #1
-    add x4, x4, x5
-    cmp x4, #0xfff
+    and x0, x2, #0xfff
+    sub x1, x3, #1
+    add x0, x0, x1
+    cmp x0, #0xfff
     bhi 90f
 
-    ldr w17, [sp, #88]             // insn low 32
-    ubfx x6, x17, #22, #2         // opc
-    tst x6, #0x1                  // L
-    cset x4, eq                   // write=1 for stores, read=0 for loads
-    mov x0, x21
-    bl _arm64_jit_mem_lookup_page_live
-    and x5, x2, #0xfff
-    add x5, x0, x5
+    ldr w17, [sp, #136]            // insn low 32
+    ubfx x0, x17, #22, #2         // opc
+    tst x0, #0x1                  // L
+    b.ne 2f                       // load
+    JIT_TLB_LOOKUP_WRITE_HIT x2, x1, x0, x16, 90f
+    b 3f
+2:
+    JIT_TLB_LOOKUP_READ_HIT x2, x1, x0, x16, 90f
+3:
+    and x16, x2, #0xfff
+    add x1, x1, x16
 
-    ubfx x6, x17, #0, #5          // rt
-    ldr x16, [sp, #80]
+    ubfx x0, x17, #0, #5          // rt
+    ldr x16, [sp, #128]
     ldr x16, [x16, #0]            // cpu*
-    add x6, x16, x6, lsl #4
-    add x6, x6, #288              // &cpu->fp[rt]
+    add x0, x16, x0, lsl #4
+    add x0, x0, #288              // &cpu->fp[rt]
 
     ubfx x16, x17, #30, #2        // size
-    ubfx x4, x17, #22, #2         // opc
+    ubfx x17, x17, #22, #2        // opc
     cmp x16, #0
     b.ne 4f
-    tst x4, #0x2
+    tst x17, #0x2
     b.eq 4f
-    tst x4, #0x1
+    tst x17, #0x1
     b.ne 10f
-    ldr x7, [x6]
-    ldr x8, [x6, #8]
-    str x7, [x5]
-    str x8, [x5, #8]
+    ldr x2, [x0]
+    ldr x3, [x0, #8]
+    str x2, [x1]
+    str x3, [x1, #8]
     b 20f
 10:
-    ldr x7, [x5]
-    ldr x8, [x5, #8]
-    str x7, [x6]
-    str x8, [x6, #8]
+    ldr x2, [x1]
+    ldr x3, [x1, #8]
+    str x2, [x0]
+    str x3, [x0, #8]
     b 20f
 
 4:
-    tst x4, #0x1
+    tst x17, #0x1
     b.ne 11f
     cmp x16, #3
     b.eq 12f
@@ -1437,20 +1590,20 @@ _arm64_jit_helper_simd_ldst_imm_unsigned_live:
     b.eq 13f
     cmp x16, #1
     b.eq 14f
-    ldrb w7, [x6]
-    strb w7, [x5]
+    ldrb w2, [x0]
+    strb w2, [x1]
     b 20f
 12:
-    ldr x7, [x6]
-    str x7, [x5]
+    ldr x2, [x0]
+    str x2, [x1]
     b 20f
 13:
-    ldr w7, [x6]
-    str w7, [x5]
+    ldr w2, [x0]
+    str w2, [x1]
     b 20f
 14:
-    ldrh w7, [x6]
-    strh w7, [x5]
+    ldrh w2, [x0]
+    strh w2, [x1]
     b 20f
 
 11:
@@ -1460,58 +1613,61 @@ _arm64_jit_helper_simd_ldst_imm_unsigned_live:
     b.eq 16f
     cmp x16, #1
     b.eq 17f
-    ldrb w7, [x5]
-    strb w7, [x6]
-    mov x7, #0
-    str x7, [x6, #8]
+    ldrb w2, [x1]
+    strb w2, [x0]
+    mov x2, #0
+    str x2, [x0, #8]
     b 20f
 15:
-    ldr x7, [x5]
-    str x7, [x6]
-    mov x7, #0
-    str x7, [x6, #8]
+    ldr x2, [x1]
+    str x2, [x0]
+    mov x2, #0
+    str x2, [x0, #8]
     b 20f
 16:
-    ldr w7, [x5]
-    str w7, [x6]
-    mov x7, #0
-    str x7, [x6, #8]
+    ldr w2, [x1]
+    str w2, [x0]
+    mov x2, #0
+    str x2, [x0, #8]
     b 20f
 17:
-    ldrh w7, [x5]
-    strh w7, [x6]
-    mov x7, #0
-    str x7, [x6, #8]
+    ldrh w2, [x1]
+    strh w2, [x0]
+    mov x2, #0
+    str x2, [x0, #8]
 
 20:
-    ldr w1, [sp, #92]
+    ldr w1, [sp, #140]
     add x1, x1, #4
-    ldr x16, [sp, #80]
+    ldr x16, [sp, #128]
     str x1, [x16, #40]             // rt->resume_pc
     ldr x16, [x16, #0]
     str x1, [x16, #272]
     mov x0, #-1
-    ldr x16, [sp, #96]
+    ldr x16, [sp, #144]
     msr nzcv, x16
+    ldp x14, x15, [sp, #112]
+    ldp x12, x13, [sp, #96]
+    ldp x10, x11, [sp, #80]
     ldp x8, x9, [sp, #64]
     ldp x6, x7, [sp, #48]
     ldp x4, x5, [sp, #32]
     ldp x16, x17, [sp, #16]
-    ldp x29, x30, [sp], #112
+    ldp x29, x30, [sp], #176
     ret
 90:
-    ldr x0, [sp, #80]
+    ldr x0, [sp, #128]
     ldr x16, [x0, #24]
     cbz x16, 91f
     blr x16
 91:
-    ldr x0, [sp, #80]
-    ldr w1, [sp, #92]
-    ldr w2, [sp, #88]
+    ldr x0, [sp, #128]
+    ldr w1, [sp, #140]
+    ldr w2, [sp, #136]
     bl _arm64_jit_c_simd_ldst_imm_unsigned
     cmp w0, #-1
     b.ne 92f
-    ldr x0, [sp, #80]
+    ldr x0, [sp, #128]
     ldr x16, [x0, #32]
     cbz x16, 92f
     mov x0, x21
@@ -1520,22 +1676,28 @@ _arm64_jit_helper_simd_ldst_imm_unsigned_live:
 92:
     cmp w0, #-1
     b.ne 93f
-    ldr x16, [sp, #96]
+    ldr x16, [sp, #144]
     msr nzcv, x16
+    ldp x14, x15, [sp, #112]
+    ldp x12, x13, [sp, #96]
+    ldp x10, x11, [sp, #80]
     ldp x8, x9, [sp, #64]
     ldp x6, x7, [sp, #48]
     ldp x4, x5, [sp, #32]
     ldp x16, x17, [sp, #16]
-    ldp x29, x30, [sp], #112
+    ldp x29, x30, [sp], #176
     ret
 93:
-    ldr x16, [sp, #96]
+    ldr x16, [sp, #144]
     msr nzcv, x16
+    ldp x14, x15, [sp, #112]
+    ldp x12, x13, [sp, #96]
+    ldp x10, x11, [sp, #80]
     ldp x8, x9, [sp, #64]
     ldp x6, x7, [sp, #48]
     ldp x4, x5, [sp, #32]
     ldp x16, x17, [sp, #16]
-    ldp x29, x30, [sp], #112
+    ldp x29, x30, [sp], #176
     JIT_FRAGMENT_EPILOGUE_AND_RET
 
 .globl _arm64_jit_helper_ldst_imm9
@@ -1797,6 +1959,57 @@ _arm64_jit_helper_ldst_imm9_load_slow:
 _arm64_jit_helper_ldst_imm9_live:
     // x0 = rt*, x1 = packed(guest_pc<<32 | insn), x2 = guest_addr, x3 = value
     // Clean live-cache path only for unscaled scalar store (mode==0, opc==0).
+    mov w17, w1                    // insn low 32
+    ubfx x0, x17, #26, #1          // V
+    cbnz x0, .Limm9_store_cold
+    ubfx x0, x17, #10, #2          // mode
+    cbnz x0, .Limm9_store_cold
+    ubfx x0, x17, #22, #2          // opc
+    cbnz x0, .Limm9_store_cold
+    ubfx x17, x17, #30, #2         // size
+
+    and x0, x2, #0xfff
+    mov x16, #1
+    lsl x16, x16, x17
+    sub x16, x16, #1
+    add x0, x0, x16
+    lsr x0, x0, #12
+    cbnz x0, .Limm9_store_cold
+
+    JIT_TLB_LOOKUP_WRITE_HIT x2, x0, x16, x17, .Limm9_store_cold
+    and x16, x2, #0xfff
+    add x16, x0, x16               // host ptr
+
+    ubfx x17, x1, #30, #2          // size
+    mov x0, #3
+    eor x0, x17, x0
+    cbz x0, 11f
+    mov x0, #2
+    eor x0, x17, x0
+    cbz x0, 12f
+    mov x0, #1
+    eor x0, x17, x0
+    cbz x0, 13f
+    strb w3, [x16]
+    b 14f
+11:
+    str x3, [x16]
+    b 14f
+12:
+    str w3, [x16]
+    b 14f
+13:
+    strh w3, [x16]
+14:
+    lsr x16, x1, #32               // guest_pc
+    add x16, x16, #4
+    str x16, [x21, #40]            // rt->resume_pc
+    ldr x17, [x21, #0]             // cpu*
+    str x16, [x17, #272]
+    mov x0, #-1
+    ret
+
+.Limm9_store_cold:
     stp x29, x30, [sp, #-48]!
     stp x1, x3, [sp, #16]
     str x4, [sp, #32]
@@ -1868,6 +2081,71 @@ _arm64_jit_helper_ldst_imm9_live:
 _arm64_jit_helper_ldst_imm9_load_live:
     // x0 = rt*, x1 = packed(guest_pc<<32 | insn), x2 = guest_addr, x3 = store_in_x1
     // Clean live-cache path only for unscaled scalar load (mode==0, opc==1).
+    mov w17, w1                    // insn low 32
+    ubfx x0, x17, #26, #1          // V
+    cbnz x0, .Limm9_load_cold
+    ubfx x0, x17, #10, #2          // mode
+    cbnz x0, .Limm9_load_cold
+    ubfx x0, x17, #22, #2          // opc
+    mov x16, #1
+    eor x0, x0, x16
+    cbnz x0, .Limm9_load_cold
+    ubfx x17, x17, #30, #2         // size
+
+    and x0, x2, #0xfff
+    mov x16, #1
+    lsl x16, x16, x17
+    sub x16, x16, #1
+    add x0, x0, x16
+    lsr x0, x0, #12
+    cbnz x0, .Limm9_load_cold
+
+    JIT_TLB_LOOKUP_READ_HIT x2, x0, x16, x17, .Limm9_load_cold
+    and x16, x2, #0xfff
+    add x16, x0, x16               // host ptr
+
+    ubfx x17, x1, #30, #2          // size
+    mov x0, #3
+    eor x0, x17, x0
+    cbz x0, 21f
+    mov x0, #2
+    eor x0, x17, x0
+    cbz x0, 22f
+    mov x0, #1
+    eor x0, x17, x0
+    cbz x0, 23f
+    ldrb w0, [x16]
+    b 24f
+21:
+    ldr x0, [x16]
+    b 24f
+22:
+    ldr w0, [x16]
+    b 24f
+23:
+    ldrh w0, [x16]
+24:
+    lsr x16, x1, #32               // guest_pc
+    cbnz x3, 25f
+    ubfx x17, x1, #0, #5          // rt
+    mov x4, #31
+    eor x4, x17, x4
+    cbz x4, 26f
+    ldr x4, [x21, #0]
+    add x4, x4, #16
+    str x0, [x4, x17, lsl #3]
+    b 26f
+25:
+    mov x1, x0
+26:
+    add x16, x16, #4
+    str x16, [x21, #40]
+    ldr x17, [x21, #0]
+    str x16, [x17, #272]
+    mov x0, #-1
+    ret
+
+.Limm9_load_cold:
     stp x29, x30, [sp, #-48]!
     stp x1, x3, [sp, #16]
     str x4, [sp, #32]
@@ -2114,8 +2392,62 @@ _arm64_jit_helper_ldst_regoff:
 _arm64_jit_helper_ldst_regoff_live:
     // x0 = rt*, x1 = packed(guest_pc<<32 | insn), x2 = guest_addr, x3 = value
     // Clean live-cache path only for scalar store, option==3.
+    mov w17, w1                    // insn low 32
+    ubfx x0, x17, #26, #1         // V
+    cbnz x0, .Lregoff_store_cold
+    ubfx x0, x17, #13, #3         // option
+    mov x16, #3
+    eor x0, x0, x16
+    cbnz x0, .Lregoff_store_cold
+    ubfx x0, x17, #22, #2         // opc
+    cbnz x0, .Lregoff_store_cold
+    ubfx x17, x17, #30, #2        // size
+
+    and x0, x2, #0xfff
+    mov x16, #1
+    lsl x16, x16, x17
+    sub x16, x16, #1
+    add x0, x0, x16
+    lsr x0, x0, #12
+    cbnz x0, .Lregoff_store_cold
+
+    JIT_TLB_LOOKUP_WRITE_HIT x2, x0, x16, x17, .Lregoff_store_cold
+    and x16, x2, #0xfff
+    add x16, x0, x16               // host ptr
+
+    ubfx x17, x1, #30, #2
+    mov x0, #3
+    eor x0, x17, x0
+    cbz x0, 31f
+    mov x0, #2
+    eor x0, x17, x0
+    cbz x0, 32f
+    mov x0, #1
+    eor x0, x17, x0
+    cbz x0, 33f
+    strb w3, [x16]
+    b 34f
+31:
+    str x3, [x16]
+    b 34f
+32:
+    str w3, [x16]
+    b 34f
+33:
+    strh w3, [x16]
+34:
+    lsr x16, x1, #32
+    add x16, x16, #4
+    str x16, [x21, #40]
+    ldr x17, [x21, #0]
+    str x16, [x17, #272]
+    mov x0, #-1
+    ret
+
+.Lregoff_store_cold:
     stp x29, x30, [sp, #-176]!
     stp x16, x17, [sp, #16]
+    mov x0, x21
     stp x0, x1, [sp, #32]
     stp x2, x3, [sp, #48]
     stp x4, x5, [sp, #64]
@@ -2239,8 +2571,76 @@ _arm64_jit_helper_ldst_regoff_live:
 _arm64_jit_helper_ldst_regoff_load_live:
     // x0 = rt*, x1 = packed(guest_pc<<32 | insn), x2 = guest_addr, x3 = store_in_x1
     // Clean live-cache path only for scalar load, option==3.
+    mov w17, w1                    // insn low 32
+    ubfx x0, x17, #26, #1         // V
+    cbnz x0, .Lregoff_load_cold
+    ubfx x0, x17, #13, #3         // option
+    mov x16, #3
+    eor x0, x0, x16
+    cbnz x0, .Lregoff_load_cold
+    ubfx x0, x17, #22, #2         // opc
+    mov x16, #1
+    eor x0, x0, x16
+    cbnz x0, .Lregoff_load_cold
+    ubfx x17, x17, #30, #2        // size
+
+    and x0, x2, #0xfff
+    mov x16, #1
+    lsl x16, x16, x17
+    sub x16, x16, #1
+    add x0, x0, x16
+    lsr x0, x0, #12
+    cbnz x0, .Lregoff_load_cold
+
+    JIT_TLB_LOOKUP_READ_HIT x2, x0, x16, x17, .Lregoff_load_cold
+    and x16, x2, #0xfff
+    add x16, x0, x16               // host ptr
+
+    ubfx x17, x1, #30, #2
+    mov x0, #3
+    eor x0, x17, x0
+    cbz x0, 41f
+    mov x0, #2
+    eor x0, x17, x0
+    cbz x0, 42f
+    mov x0, #1
+    eor x0, x17, x0
+    cbz x0, 43f
+    ldrb w0, [x16]
+    b 44f
+41:
+    ldr x0, [x16]
+    b 44f
+42:
+    ldr w0, [x16]
+    b 44f
+43:
+    ldrh w0, [x16]
+44:
+    lsr x16, x1, #32
+    cbnz x3, 45f
+    ubfx x17, x1, #0, #5
+    mov x3, #31
+    eor x3, x17, x3
+    cbz x3, 46f
+    ldr x3, [x21, #0]
+    add x3, x3, #16
+    str x0, [x3, x17, lsl #3]
+    b 46f
+45:
+    mov x1, x0
+46:
+    add x16, x16, #4
+    str x16, [x21, #40]
+    ldr x17, [x21, #0]
+    str x16, [x17, #272]
+    mov x0, #-1
+    ret
+
+.Lregoff_load_cold:
     stp x29, x30, [sp, #-176]!
     stp x16, x17, [sp, #16]
+    mov x0, x21
     stp x0, x1, [sp, #32]
     stp x2, x3, [sp, #48]
     stp x4, x5, [sp, #64]
@@ -2689,15 +3089,18 @@ _arm64_jit_helper_ldst_pair:
 _arm64_jit_helper_ldst_pair_load_live:
     // x0 = rt*, x1 = packed(guest_pc<<32 | insn), x2 = guest_addr, x3 = return_in_x1_x2
     // Clean live-cache path only for scalar offset pair loads (V==0, L==1, mode==2, opc==0/2).
-    stp x29, x30, [sp, #-128]!
+    stp x29, x30, [sp, #-176]!
     stp x16, x17, [sp, #16]
     stp x0, x1, [sp, #32]
     stp x2, x3, [sp, #48]
     stp x4, x5, [sp, #64]
     stp x6, x7, [sp, #80]
     stp x8, x9, [sp, #96]
+    stp x10, x11, [sp, #112]
+    stp x12, x13, [sp, #128]
+    stp x14, x15, [sp, #144]
     mrs x16, nzcv
-    str x16, [sp, #112]
+    str x16, [sp, #160]
 
     ldr w16, [sp, #40]             // insn low 32
     ubfx x17, x16, #26, #1         // V
@@ -2713,76 +3116,75 @@ _arm64_jit_helper_ldst_pair_load_live:
     cmp x17, #2
     b.ne 90f
 1:
-    mov x4, #4
+    mov x0, #4
     cmp x17, #2
-    cinc x4, x4, eq                // x4 = 5 when 64-bit? no, replaced below
+    cinc x0, x0, eq                // x0 = 5 when 64-bit? no, replaced below
     cmp x17, #2
     b.ne 2f
-    mov x4, #8
+    mov x0, #8
     b 3f
 2:
-    mov x4, #4
+    mov x0, #4
 3:
-    and x5, x2, #0xfff
-    lsl x6, x4, #1                 // pair width
-    sub x6, x6, #1
-    add x5, x5, x6
-    cmp x5, #0xfff
+    and x1, x2, #0xfff
+    lsl x3, x0, #1                 // pair width
+    sub x3, x3, #1
+    add x1, x1, x3
+    cmp x1, #0xfff
     bhi 90f
 
-    ldr x1, [sp, #40]              // packed
-    mov x0, x21
-    mov x3, #0
-    bl _arm64_jit_mem_lookup_page_live
+    JIT_TLB_LOOKUP_READ_HIT x2, x0, x1, x17, 90f
     ldr x1, [sp, #40]              // packed
     ldr x3, [sp, #56]              // return_in_x1_x2
-    and x6, x2, #0xfff
-    add x6, x0, x6                 // host ptr
+    and x17, x2, #0xfff
+    add x17, x0, x17               // host ptr
 
     ldr w16, [sp, #40]
-    ubfx x17, x16, #30, #2         // opc
-    cmp x17, #2
+    ubfx x16, x16, #30, #2         // opc
+    cmp x16, #2
     b.eq 10f
-    ldr w7, [x6]
-    ldr w16, [x6, #4]
+    ldr w0, [x17]
+    ldr w2, [x17, #4]
     b 11f
 10:
-    ldr x7, [x6]
-    ldr x16, [x6, #8]
+    ldr x0, [x17]
+    ldr x2, [x17, #8]
 11:
     cbnz x3, 12f
     ldr w9, [sp, #40]              // insn low 32
-    ubfx x5, x9, #0, #5            // rt
-    ubfx x6, x9, #10, #5           // rt2
+    ubfx x1, x9, #0, #5            // rt
+    ubfx x3, x9, #10, #5           // rt2
     ldr x17, [sp, #32]
     ldr x17, [x17, #0]
     add x17, x17, #16
-    cmp x5, #31
+    cmp x1, #31
     b.eq 13f
-    str x7, [x17, x5, lsl #3]
+    str x0, [x17, x1, lsl #3]
 13:
-    cmp x6, #31
+    cmp x3, #31
     b.eq 14f
-    str x16, [x17, x6, lsl #3]
+    str x2, [x17, x3, lsl #3]
     b 14f
 12:
-    mov x1, x7
-    mov x2, x16
+    mov x1, x0
 14:
-    ldr w4, [sp, #44]
-    add x4, x4, #4
+    ldr w0, [sp, #44]
+    add x0, x0, #4
     ldr x17, [sp, #32]
-    str x4, [x17, #40]             // rt->resume_pc
+    str x0, [x17, #40]             // rt->resume_pc
     ldr x17, [x17, #0]
-    str x4, [x17, #272]
-    ldr x16, [sp, #112]
+    str x0, [x17, #272]
+    ldr x16, [sp, #160]
     msr nzcv, x16
     mov x0, #-1
+    ldp x14, x15, [sp, #144]
+    ldp x12, x13, [sp, #128]
+    ldp x10, x11, [sp, #112]
     ldp x8, x9, [sp, #96]
     ldp x6, x7, [sp, #80]
     ldp x4, x5, [sp, #64]
     ldp x16, x17, [sp, #16]
-    ldp x29, x30, [sp], #128
+    ldp x29, x30, [sp], #176
     ret
 90:
     ldr x0, [sp, #32]
@@ -2826,29 +3228,35 @@ _arm64_jit_helper_ldst_pair_load_live:
 98:
     cmp w0, #-1
     b.ne 99f
-    ldr x16, [sp, #112]
+    ldr x16, [sp, #160]
     msr nzcv, x16
 99:
+    ldp x14, x15, [sp, #144]
+    ldp x12, x13, [sp, #128]
+    ldp x10, x11, [sp, #112]
     ldp x8, x9, [sp, #96]
     ldp x6, x7, [sp, #80]
     ldp x4, x5, [sp, #64]
     ldp x16, x17, [sp, #16]
-    ldp x29, x30, [sp], #128
+    ldp x29, x30, [sp], #176
     ret
 
 .globl _arm64_jit_helper_ldst_pair_store_live
 _arm64_jit_helper_ldst_pair_store_live:
     // x0 = rt*, x1 = packed(guest_pc<<32 | insn), x2 = guest_addr, x3 = val0, x16 = val1
     // Clean live-cache path only for scalar offset pair stores (V==0, L==0, mode==2, opc==0/2).
-    stp x29, x30, [sp, #-128]!
+    stp x29, x30, [sp, #-176]!
     stp x16, x17, [sp, #16]
     stp x0, x1, [sp, #32]
     stp x2, x3, [sp, #48]
     stp x4, x5, [sp, #64]
     stp x6, x7, [sp, #80]
     stp x8, x9, [sp, #96]
+    stp x10, x11, [sp, #112]
+    stp x12, x13, [sp, #128]
+    stp x14, x15, [sp, #144]
     mrs x16, nzcv
-    str x16, [sp, #112]
+    str x16, [sp, #160]
 
     ldr w16, [sp, #40]             // insn low 32
     ubfx x17, x16, #26, #1         // V
@@ -2864,38 +3272,35 @@ _arm64_jit_helper_ldst_pair_store_live:
     cmp x17, #2
     b.ne 90f
 1:
-    mov x5, #4
+    mov x0, #4
     cmp x17, #2
     b.ne 2f
-    mov x5, #8
+    mov x0, #8
 2:
-    and x6, x2, #0xfff
-    lsl x7, x5, #1                 // pair width
-    sub x7, x7, #1
-    add x6, x6, x7
-    cmp x6, #0xfff
+    and x1, x2, #0xfff
+    lsl x3, x0, #1                 // pair width
+    sub x3, x3, #1
+    add x1, x1, x3
+    cmp x1, #0xfff
     bhi 90f
 
-    ldr x1, [sp, #40]              // packed
-    mov x0, x21
-    mov x4, #1
-    bl _arm64_jit_mem_lookup_page_live
+    JIT_TLB_LOOKUP_WRITE_HIT x2, x0, x1, x17, 90f
     ldr x1, [sp, #40]              // packed
     ldr x3, [sp, #56]              // val0
-    and x7, x2, #0xfff
-    add x7, x0, x7                 // host ptr
+    and x17, x2, #0xfff
+    add x17, x0, x17               // host ptr
 
     ldr w16, [sp, #40]
-    ubfx x17, x16, #30, #2         // opc
+    ubfx x16, x16, #30, #2         // opc
     ldr x8, [sp, #16]              // saved incoming val1 from x16
-    cmp x17, #2
+    cmp x16, #2
     b.eq 10f
-    str w3, [x7]
-    str w8, [x7, #4]
+    str w3, [x17]
+    str w8, [x17, #4]
     b 11f
 10:
-    str x3, [x7]
-    str x8, [x7, #8]
+    str x3, [x17]
+    str x8, [x17, #8]
 11:
     ldr w1, [sp, #44]
     add x1, x1, #4
@@ -2903,14 +3308,17 @@ _arm64_jit_helper_ldst_pair_store_live:
     str x1, [x17, #40]             // rt->resume_pc
     ldr x17, [x17, #0]
     str x1, [x17, #272]
-    ldr x16, [sp, #112]
+    ldr x16, [sp, #160]
     msr nzcv, x16
     mov x0, #-1
+    ldp x14, x15, [sp, #144]
+    ldp x12, x13, [sp, #128]
+    ldp x10, x11, [sp, #112]
     ldp x8, x9, [sp, #96]
     ldp x6, x7, [sp, #80]
     ldp x4, x5, [sp, #64]
     ldp x16, x17, [sp, #16]
-    ldp x29, x30, [sp], #128
+    ldp x29, x30, [sp], #176
     ret
 90:
     ldr x0, [sp, #32]
@@ -2933,14 +3341,17 @@ _arm64_jit_helper_ldst_pair_store_live:
 97:
     cmp w0, #-1
     b.ne 98f
-    ldr x16, [sp, #112]
+    ldr x16, [sp, #160]
     msr nzcv, x16
 98:
+    ldp x14, x15, [sp, #144]
+    ldp x12, x13, [sp, #128]
+    ldp x10, x11, [sp, #112]
     ldp x8, x9, [sp, #96]
     ldp x6, x7, [sp, #80]
     ldp x4, x5, [sp, #64]
     ldp x16, x17, [sp, #16]
-    ldp x29, x30, [sp], #128
+    ldp x29, x30, [sp], #176
     ret
 
 .globl _arm64_jit_helper_ldst_pair_vec_live

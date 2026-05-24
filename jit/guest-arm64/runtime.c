@@ -352,7 +352,8 @@ int arm64_jit_handle_verify_sigtrap(void *ctx) {
     const struct arm64_jit_verify_site *site = NULL;
     if (pc >= base && pc < base + block->code_size) {
         uint32_t off = (uint32_t) (pc - base);
-        if (block->start_pc == 0xefeb64a4 || block->start_pc == 0xefe62420 || block->start_pc == 0xefe62410) {
+        if (block->start_pc == 0xefeb64a4 || block->start_pc == 0xefe62420 ||
+                block->start_pc == 0xefe62410 || block->start_pc == 0xefeb4220) {
             arm64_jit_verify_log(
                     "[arm64-jit-verify] sigtrap-focus pc=%p base=%p off=0x%x code_size=0x%x start=0x%llx\n",
                     (void *) pc, (void *) base, off, block->code_size,
@@ -361,7 +362,8 @@ int arm64_jit_handle_verify_sigtrap(void *ctx) {
         site = arm64_jit_find_verify_site(block, off);
     }
     if (site == NULL) {
-        if (block->start_pc == 0xefeb64a4 || block->start_pc == 0xefe62420 || block->start_pc == 0xefe62410) {
+        if (block->start_pc == 0xefeb64a4 || block->start_pc == 0xefe62420 ||
+                block->start_pc == 0xefe62410 || block->start_pc == 0xefeb4220) {
             arm64_jit_verify_log(
                     "[arm64-jit-verify] sigtrap-focus no-site pc=%p base=%p start=0x%llx\n",
                     (void *) pc, (void *) base,
@@ -369,7 +371,8 @@ int arm64_jit_handle_verify_sigtrap(void *ctx) {
         }
         return 0;
     }
-    if (block->start_pc == 0xefeb64a4 || block->start_pc == 0xefe62420 || block->start_pc == 0xefe62410) {
+    if (block->start_pc == 0xefeb64a4 || block->start_pc == 0xefe62420 ||
+            block->start_pc == 0xefe62410 || block->start_pc == 0xefeb4220) {
         arm64_jit_verify_log(
                 "[arm64-jit-verify] sigtrap-focus site off=0x%x guest_pc=0x%llx insn=0x%08x start=0x%llx\n",
                 site->host_offset,
@@ -3522,7 +3525,8 @@ static int arm64_jit_run_block_from_index(struct arm64_jit_block *block, uint32_
     if (arm64_jit_verify_mode() &&
             (block->insn_pcs[entry_index] == 0xefeb64a4 ||
              block->insn_pcs[entry_index] == 0xefe62420 ||
-             block->insn_pcs[entry_index] == 0xefe62410)) {
+             block->insn_pcs[entry_index] == 0xefe62410 ||
+             block->insn_pcs[entry_index] == 0xefeb4220)) {
         arm64_jit_verify_log(
                 "[arm64-jit-verify] mark-focus-a idx=%u direct=%d entry=%p code=%p thunk0=%p off=0x%x cpu_pc=0x%llx start=0x%llx\n",
                 (unsigned) entry_index,
@@ -3554,7 +3558,8 @@ static int arm64_jit_run_block_from_index(struct arm64_jit_block *block, uint32_
     if (arm64_jit_verify_mode()) {
         if (block->insn_pcs[entry_index] == 0xefeb64a4 ||
                 block->insn_pcs[entry_index] == 0xefe62420 ||
-                block->insn_pcs[entry_index] == 0xefe62410) {
+                block->insn_pcs[entry_index] == 0xefe62410 ||
+                block->insn_pcs[entry_index] == 0xefeb4220) {
             arm64_jit_verify_log(
                     "[arm64-jit-verify] mark-focus-b before-sigsetjmp trap_valid=%d start=0x%llx\n",
                     vs->trap_env_valid ? 1 : 0,
@@ -3564,14 +3569,16 @@ static int arm64_jit_run_block_from_index(struct arm64_jit_block *block, uint32_
         if (sigsetjmp(vs->trap_env, 1) == 0) {
             if (block->insn_pcs[entry_index] == 0xefeb64a4 ||
                     block->insn_pcs[entry_index] == 0xefe62420 ||
-                    block->insn_pcs[entry_index] == 0xefe62410) {
+                    block->insn_pcs[entry_index] == 0xefe62410 ||
+                    block->insn_pcs[entry_index] == 0xefeb4220) {
                 arm64_jit_verify_log(
                         "[arm64-jit-verify] mark-focus-c after-sigsetjmp start=0x%llx\n",
                         (unsigned long long) block->insn_pcs[entry_index]);
             }
             if (block->insn_pcs[entry_index] == 0xefeb64a4 ||
                     block->insn_pcs[entry_index] == 0xefe62420 ||
-                    block->insn_pcs[entry_index] == 0xefe62410) {
+                    block->insn_pcs[entry_index] == 0xefe62410 ||
+                    block->insn_pcs[entry_index] == 0xefeb4220) {
                 arm64_jit_verify_log(
                         "[arm64-jit-verify] call-focus-pre entry=%p code=%p off=0x%x cpu_pc=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x30=0x%llx start=0x%llx\n",
                         entry, block->code_rx, block->insn_host_offsets[entry_index],
@@ -3585,7 +3592,8 @@ static int arm64_jit_run_block_from_index(struct arm64_jit_block *block, uint32_
             interrupt = ((arm64_jit_entry_fn_t) entry)(&rt);
             if (block->insn_pcs[entry_index] == 0xefeb64a4 ||
                     block->insn_pcs[entry_index] == 0xefe62420 ||
-                    block->insn_pcs[entry_index] == 0xefe62410) {
+                    block->insn_pcs[entry_index] == 0xefe62410 ||
+                    block->insn_pcs[entry_index] == 0xefeb4220) {
                 arm64_jit_verify_log(
                         "[arm64-jit-verify] call-focus-post interrupt=%d rt_exit=%d resume_pc=0x%llx cpu_pc=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x30=0x%llx start=0x%llx\n",
                         interrupt, rt.exit_interrupt,
@@ -3791,7 +3799,8 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb) {
         }
 
         if (arm64_jit_verify_mode() &&
-                (cpu->pc == 0xefeb64a4 || cpu->pc == 0xefe62420 || cpu->pc == 0xefe62410)) {
+                (cpu->pc == 0xefeb64a4 || cpu->pc == 0xefe62420 || cpu->pc == 0xefe62410 ||
+                 cpu->pc == 0xefeb4220)) {
             uint32_t off0 = block->insn_host_offsets[entry_index];
             void *entry0 = block->entry_code[entry_index] ? block->entry_code[entry_index] : block->code_rx;
             uint32_t *entry_w = (uint32_t *) entry0;
@@ -3813,7 +3822,8 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb) {
         if (arm64_jit_verify_mode() &&
                 (block->insn_pcs[entry_index] == 0xefeb64a4 ||
                  block->insn_pcs[entry_index] == 0xefe62420 ||
-                 block->insn_pcs[entry_index] == 0xefe62410)) {
+                 block->insn_pcs[entry_index] == 0xefe62410 ||
+                 block->insn_pcs[entry_index] == 0xefeb4220)) {
             arm64_jit_verify_log(
                     "[arm64-jit-verify] leave-focus interrupt=%d cpu_pc=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x30=0x%llx start=0x%llx\n",
                     interrupt,
