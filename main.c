@@ -47,6 +47,30 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     // This avoids the overhead of _setjmp on every block entry.
     if ((sig == SIGSEGV || sig == SIGBUS) && in_jit) {
         ucontext_t *uc = (ucontext_t *)ctx;
+        if (jit_saved_pc == 0xefeb64a4 || jit_saved_pc == 0xefeb6494) {
+            uint64_t rt_ptr = uc->uc_mcontext->__ss.__x[21];
+            fprintf(stderr,
+                    "[arm64-jit-crash] sig=%d saved_pc=0x%llx host_pc=0x%llx addr=%p x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x4=0x%llx x7=0x%llx x10=0x%llx x16=0x%llx x17=0x%llx x21=0x%llx sp=0x%llx dbg0=0x%llx dbg1=0x%llx dbg2=0x%llx dbg3=0x%llx\n",
+                    sig,
+                    (unsigned long long) jit_saved_pc,
+                    (unsigned long long) uc->uc_mcontext->__ss.__pc,
+                    info->si_addr,
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[0],
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[1],
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[2],
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[3],
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[4],
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[7],
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[10],
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[16],
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[17],
+                    (unsigned long long) uc->uc_mcontext->__ss.__x[21],
+                    (unsigned long long) uc->uc_mcontext->__ss.__sp,
+                    (unsigned long long) *(uint64_t *)(rt_ptr + 64),
+                    (unsigned long long) *(uint64_t *)(rt_ptr + 72),
+                    (unsigned long long) *(uint64_t *)(rt_ptr + 80),
+                    (unsigned long long) *(uint64_t *)(rt_ptr + 88));
+        }
 
         // _cpu is in x1 — pointer to cpu_state within fiber_frame
         uint64_t cpu_ptr = uc->uc_mcontext->__ss.__x[1];
@@ -248,6 +272,7 @@ static void microbench_signal_dump(int sig) {
     dump_pc_hist();
     dump_pc_trace();
 #ifdef GUEST_ARM64
+    arm64_jit_dump_tlb_profile();
     // Walk all tasks, dump guest x21 if available (microbench counter reg).
     extern struct pid pids[];
     for (int i = 1; i < 8; i++) {
@@ -275,6 +300,10 @@ int main(int argc, char *const argv[]) {
     }
 #ifdef ISH_GADGET_PROFILE
     atexit(dump_gadget_profile);
+#endif
+#if defined(GUEST_ARM64)
+    if (getenv("ISH_ARM64_JIT_TLB_PROFILE"))
+        atexit(arm64_jit_dump_tlb_profile);
 #endif
     // Save host terminal settings so we can restore on exit
     if (isatty(STDIN_FILENO)) {

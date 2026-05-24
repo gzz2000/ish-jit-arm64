@@ -19,9 +19,9 @@
 
 #define ARM64_JIT_HASH_SIZE (1 << 10)
 #define ARM64_JIT_PAGE_HASH_SIZE (1 << 10)
-#define ARM64_JIT_MAX_INSNS 256
-#define ARM64_JIT_MAX_PC_MAP 512
-#define ARM64_JIT_MAX_FIXUPS 512
+#define ARM64_JIT_MAX_INSNS 1024
+#define ARM64_JIT_MAX_PC_MAP 2048
+#define ARM64_JIT_MAX_FIXUPS 2048
 #define ARM64_JIT_MAX_GPR_USES 6
 #define ARM64_JIT_MAX_ALLOCATABLE_GPRS 18
 #define ARM64_JIT_MAX_VERIFY_SITES ARM64_JIT_MAX_INSNS
@@ -109,11 +109,18 @@ struct arm64_jit_block {
     struct list hash_chain;
     struct list page[2];
     struct list jetsam;
+    struct list entrypoints;
     uint8_t *code_rw;
     void *code_rx;
     void *spill_state_fn;
     void *reload_state_fn;
     uint32_t code_size;
+    uint32_t body_code_size;
+    uint32_t spill_code_offset;
+    uint32_t reload_code_offset;
+    uint32_t entry_thunks_offset;
+    uint32_t insn_host_offsets[ARM64_JIT_MAX_INSNS];
+    void *entry_code[ARM64_JIT_MAX_INSNS];
     uint32_t pc_map_count;
     struct arm64_jit_pc_map pc_map[ARM64_JIT_MAX_PC_MAP];
     uint32_t verify_site_count;
@@ -124,10 +131,20 @@ struct arm64_jit_block {
     addr_t disabled_local_fixup_pcs[ARM64_JIT_MAX_FIXUPS];
 };
 
+struct arm64_jit_entrypoint {
+    addr_t pc;
+    struct arm64_jit_block *block;
+    uint16_t entry_index;
+    struct list hash_chain;
+    struct list block_chain;
+};
+
 struct arm64_jit_state {
     struct mmu *mmu;
     struct list *hash;
     size_t hash_size;
+    struct list *entry_hash;
+    size_t entry_hash_size;
     struct arm64_jit_page_bucket *page_hash;
     struct list jetsam;
     lock_t lock;
@@ -144,7 +161,20 @@ struct arm64_jit_runtime {
     addr_t resume_pc;
     addr_t fault_pc;
     int exit_interrupt;
+    uint64_t debug0;
+    uint64_t debug1;
+    uint64_t debug2;
+    uint64_t debug3;
+    void *entry_target;
 };
+
+struct arm64_jit_tlb_profile {
+    _Atomic uint64_t bench_integer_lookups;
+    _Atomic uint64_t bench_integer_hits;
+    _Atomic uint64_t bench_integer_misses;
+};
+
+extern struct arm64_jit_tlb_profile g_arm64_jit_tlb_profile;
 
 struct arm64_jit_emitter {
     struct arm64_jit_state *state;
@@ -152,6 +182,7 @@ struct arm64_jit_emitter {
     uint8_t *buf;
     size_t cap;
     size_t size;
+    bool overflowed;
 };
 
 enum arm64_jit_fixup_kind {
@@ -182,6 +213,7 @@ int arm64_jit_verify_mode(void);
 int arm64_jit_handle_verify_sigtrap(void *ctx);
 void arm64_jit_set_saved_pc(addr_t pc);
 void arm64_jit_record_fault_pc(void *host_pc);
+void arm64_jit_dump_tlb_profile(void);
 
 int c_load64(struct tlb *tlb, addr_t addr, uint64_t *out);
 int c_load32(struct tlb *tlb, addr_t addr, uint32_t *out);
@@ -261,11 +293,23 @@ int arm64_jit_helper_ldr_imm_unsigned_jitabi(struct arm64_jit_runtime *rt, uint6
 int arm64_jit_helper_str_imm_unsigned_jitabi(struct arm64_jit_runtime *rt, uint64_t packed);
 int arm64_jit_helper_simd_ldst_imm_unsigned_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
         uint32_t insn);
+int arm64_jit_helper_ldr_imm_unsigned_success_jitabi(struct arm64_jit_runtime *rt, uint64_t packed0, uint64_t packed1);
+int arm64_jit_helper_str_imm_unsigned_success_jitabi(struct arm64_jit_runtime *rt, uint64_t packed);
+int arm64_jit_helper_simd_ldst_imm_unsigned_success_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
+        uint32_t insn);
 int arm64_jit_helper_ldst_imm9_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
         uint32_t insn);
 int arm64_jit_helper_ldst_regoff_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
         uint32_t insn);
 int arm64_jit_helper_ldst_pair_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
+        uint32_t insn);
+int arm64_jit_helper_ldst_imm9_success_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
+        uint32_t insn);
+int arm64_jit_helper_ldst_regoff_success_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
+        uint32_t insn);
+int arm64_jit_helper_ldst_pair_success_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
+        uint32_t insn);
+int arm64_jit_helper_ldst_excl_success_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
         uint32_t insn);
 int arm64_jit_helper_ldst_excl_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
         uint32_t insn);
@@ -289,6 +333,7 @@ uint32_t arm64_jit_enc_movz(unsigned rd, uint16_t imm16, unsigned shift);
 uint32_t arm64_jit_enc_movk(unsigned rd, uint16_t imm16, unsigned shift);
 uint32_t arm64_jit_enc_mov_reg(unsigned rd, unsigned rn);
 uint32_t arm64_jit_enc_blr(unsigned rn);
+uint32_t arm64_jit_enc_br(unsigned rn);
 uint32_t arm64_jit_enc_ret(unsigned rn);
 uint32_t arm64_jit_enc_ldr64_uimm(unsigned rt, unsigned rn, unsigned imm12);
 uint32_t arm64_jit_enc_str64_uimm(unsigned rt, unsigned rn, unsigned imm12);
