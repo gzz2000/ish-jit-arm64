@@ -1898,6 +1898,94 @@ int arm64_jit_c_simd_ldst_imm_unsigned(struct arm64_jit_runtime *rt, addr_t gues
     return INT_NONE;
 }
 
+static int arm64_jit_simd_ldst_multi_num_regs(uint32_t opcode) {
+    switch (opcode) {
+        case 0x7:
+            return 1;
+        case 0xa:
+            return 2;
+        case 0x6:
+            return 3;
+        case 0x2:
+            return 4;
+        default:
+            return 0;
+    }
+}
+
+int arm64_jit_c_simd_ldst_multi(struct arm64_jit_runtime *rt, addr_t guest_pc,
+        uint32_t insn) {
+    bool is_no_post = (insn & 0xbfbf0000u) == 0x0c000000u;
+    bool is_post = (insn & 0xbfa00000u) == 0x0c800000u;
+    if (!is_no_post && !is_post)
+        return arm64_jit_helper_unsupported(rt, guest_pc);
+
+    struct cpu_state *cpu = rt->cpu;
+    uint32_t Q = (insn >> 30) & 1;
+    uint32_t L = (insn >> 22) & 1;
+    uint32_t rm = (insn >> 16) & 0x1f;
+    uint32_t opcode = (insn >> 12) & 0xf;
+    uint32_t size = (insn >> 10) & 0x3;
+    uint32_t rn = ARM64_RN(insn);
+    uint32_t rt_reg = ARM64_RT(insn);
+    int num_regs = arm64_jit_simd_ldst_multi_num_regs(opcode);
+    if (num_regs == 0)
+        return arm64_jit_helper_unsupported(rt, guest_pc);
+
+    (void) size;
+    uint64_t base = arm64_jit_read_gpr(cpu, rn, true);
+    uint32_t bytes_per_reg = Q ? 16 : 8;
+    int rc = 0;
+
+    for (int i = 0; i < num_regs; i++) {
+        uint32_t vt = (rt_reg + (uint32_t) i) & 0x1f;
+        addr_t addr = base + (addr_t) i * bytes_per_reg;
+        if (L) {
+            uint64_t lo = 0;
+            uint64_t hi = 0;
+            rc = c_load64(rt->tlb, addr, &lo);
+            if (rc == 0 && Q)
+                rc = c_load64(rt->tlb, addr + 8, &hi);
+            if (rc != 0)
+                break;
+            cpu->fp[vt].d[0] = lo;
+            cpu->fp[vt].d[1] = Q ? hi : 0;
+        } else {
+            rc = c_store64(rt->tlb, addr, cpu->fp[vt].d[0]);
+            if (rc == 0 && Q)
+                rc = c_store64(rt->tlb, addr + 8, cpu->fp[vt].d[1]);
+            if (rc != 0)
+                break;
+        }
+    }
+
+    if (rc != 0) {
+        cpu->segfault_addr = rt->tlb->segfault_addr;
+        cpu->segfault_was_write = !L;
+        cpu->pc = guest_pc;
+        rt->resume_pc = guest_pc;
+        rt->exit_interrupt = INT_GPF;
+        return INT_GPF;
+    }
+
+    if (is_post) {
+        uint64_t writeback;
+        if (rm == 31)
+            writeback = base + (uint64_t) bytes_per_reg * (uint64_t) num_regs;
+        else
+            writeback = base + arm64_jit_read_gpr(cpu, rm, false);
+        if (rn == 31)
+            cpu->sp = writeback;
+        else
+            cpu->regs[rn] = writeback;
+    }
+
+    rt->resume_pc = guest_pc + 4;
+    cpu->pc = guest_pc + 4;
+    rt->exit_interrupt = INT_NONE;
+    return INT_NONE;
+}
+
 int arm64_jit_c_ldst_imm9(struct arm64_jit_runtime *rt, addr_t guest_pc, uint32_t insn) {
     uint32_t size = (insn >> 30) & 0x3;
     uint32_t V = (insn >> 26) & 1;

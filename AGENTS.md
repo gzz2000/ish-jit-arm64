@@ -63,6 +63,13 @@ Use these exact commands during JIT development:
 ninja -C build-arm64-release
 ```
 
+If sandboxed execution blocks the default ccache directory under
+`~/Library/Caches`, keep ccache inside writable temp storage:
+
+```bash
+env CCACHE_DIR=/private/tmp/ish-arm64-ccache ninja -C build-arm64-release
+```
+
 ### First-time setup, only if `build-arm64-release` does not exist yet
 
 ```bash

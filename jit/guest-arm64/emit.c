@@ -773,6 +773,36 @@ static bool arm64_jit_emit_simd_fp_cached(struct arm64_jit_emitter *e, uint32_t 
         default:
             break;
     }
+    if ((insn & 0xfffffc00u) == 0x1e270000u || // FMOV Sd, Wn
+            (insn & 0xfffffc00u) == 0x9e670000u) { // FMOV Dd, Xn
+        uint32_t rn = ARM64_RN(insn);
+        int src = arm64_jit_guest_src_host_reg_or_zr(e->block, rn);
+        if (src < 0) {
+            if (rn >= 31)
+                src = 31;
+            else {
+                src = ARM64_JIT_HOST_HELPER0;
+                arm64_jit_emit32(e, arm64_jit_enc_ldr64_uimm((unsigned) src, ARM64_JIT_HOST_CPU,
+                        (CPU_OFFSET(regs[rn]) >> 3)));
+            }
+        }
+        arm64_jit_emit32(e, (insn & ~((uint32_t) 0x1f << 5)) | ((uint32_t) src << 5));
+        return true;
+    }
+    if ((insn & 0xfffffc00u) == 0x1e260000u || // FMOV Wd, Sn
+            (insn & 0xfffffc00u) == 0x9e660000u) { // FMOV Xd, Dn
+        uint32_t rd = ARM64_RD(insn);
+        int dst = arm64_jit_host_reg_for_guest(e->block, rd);
+        if (dst >= 0 || rd >= 31) {
+            unsigned host_dst = (dst >= 0) ? (unsigned) dst : 31;
+            arm64_jit_emit32(e, (insn & ~((uint32_t) 0x1f)) | host_dst);
+            return true;
+        }
+        arm64_jit_emit32(e, (insn & ~((uint32_t) 0x1f)) | ARM64_JIT_HOST_HELPER0);
+        arm64_jit_emit32(e, arm64_jit_enc_str64_uimm(ARM64_JIT_HOST_HELPER0, ARM64_JIT_HOST_CPU,
+                (CPU_OFFSET(regs[rd]) >> 3)));
+        return true;
+    }
     if ((insn & 0xfffffc00u) == 0x1e204000u) { // FMOV Sd, Sn
         arm64_jit_emit32(e, insn);
         return true;
@@ -874,6 +904,17 @@ static bool arm64_jit_emit_simd_fp_cached(struct arm64_jit_emitter *e, uint32_t 
         return true;
     }
     if ((insn & 0xffe0fc00u) == 0x5e000400u) { // DUP (element, scalar)
+        arm64_jit_emit32(e, insn);
+        return true;
+    }
+    if ((insn & 0xffe0fc00u) == 0x0f00a400u ||
+            (insn & 0xffe0fc00u) == 0x0f20a400u ||
+            (insn & 0xffe0fc00u) == 0x4f00a400u ||
+            (insn & 0xffe0fc00u) == 0x4f20a400u ||
+            (insn & 0xffe0fc00u) == 0x2f00a400u ||
+            (insn & 0xffe0fc00u) == 0x2f20a400u ||
+            (insn & 0xffe0fc00u) == 0x6f00a400u ||
+            (insn & 0xffe0fc00u) == 0x6f20a400u) { // SSHLL/SSHLL2/USHLL/USHLL2
         arm64_jit_emit32(e, insn);
         return true;
     }
@@ -1723,6 +1764,12 @@ enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uin
         return ARM64_JIT_EMIT_CONTINUE;
     }
 
+    if ((insn & 0xbfbf0000u) == 0x0c000000u ||
+            (insn & 0xbfa00000u) == 0x0c800000u) {
+        arm64_jit_emit_helper_success_regarg(e, arm64_jit_helper_simd_ldst_multi_success_jitabi, guest_pc, insn);
+        return ARM64_JIT_EMIT_CONTINUE;
+    }
+
     if ((insn & 0x3a000000u) == 0x28000000u) {
         if (arm64_jit_trace_mode() && (guest_pc == 0xefe62688 || guest_pc == 0xefe6268c)) {
             fprintf(stderr, "[arm64-jit] emit_ld_st pair pc=0x%llx insn=0x%08x V=%u opc=%u mode=%u L=%u\n",
@@ -1814,7 +1861,7 @@ enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uin
         arm64_jit_emit_helper_success_regarg(e, arm64_jit_helper_ldst_pair_success_jitabi, guest_pc, insn);
         return ARM64_JIT_EMIT_CONTINUE;
     }
-    if ((insn & 0x3b200000u) == 0x38000000u) {
+    if (!((insn >> 26) & 1) && (insn & 0x3b200000u) == 0x38000000u) {
         uint32_t opc9 = (insn >> 22) & 0x3;
         uint32_t mode9 = (insn >> 10) & 0x3;
         uint32_t rn9 = ARM64_RN(insn);
@@ -1929,7 +1976,7 @@ enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uin
         return ARM64_JIT_EMIT_CONTINUE;
     }
 
-    if (((insn >> 26) & 1) == 1 && (insn & 0x3b200c00u) == 0x3c000800u) {
+    if (((insn >> 26) & 1) == 1 && (insn & 0x3b200000u) == 0x38000000u) {
         arm64_jit_emit_helper_success_regarg(e, arm64_jit_helper_ldst_imm9_success_jitabi, guest_pc, insn);
         return ARM64_JIT_EMIT_CONTINUE;
     }
@@ -1941,8 +1988,7 @@ enum arm64_jit_emit_result arm64_jit_emit_ld_st(struct arm64_jit_emitter *e, uin
     uint32_t rt = ARM64_RT(insn);
     uint32_t imm12 = (insn >> 10) & 0xfff;
 
-    if (V && ((insn & 0x3b000000u) == 0x39000000u ||
-              (insn & 0x3b000000u) == 0x38000000u)) {
+    if (V && (insn & 0x3b000000u) == 0x39000000u) {
         if (arm64_jit_trace_mode() && (guest_pc == 0xefe62688 || guest_pc == 0xefe6268c)) {
             fprintf(stderr, "[arm64-jit] emit_ld_st simd_uimm pc=0x%llx insn=0x%08x\n",
                     (unsigned long long) guest_pc, insn);
