@@ -19,6 +19,7 @@
 
 #define ARM64_JIT_HASH_SIZE (1 << 10)
 #define ARM64_JIT_PAGE_HASH_SIZE (1 << 10)
+#define ARM64_JIT_ENTRY_CACHE_SIZE (1 << 12)
 #define ARM64_JIT_MAX_INSNS 1024
 #define ARM64_JIT_MAX_PC_MAP 2048
 #define ARM64_JIT_MAX_FIXUPS 2048
@@ -139,12 +140,21 @@ struct arm64_jit_entrypoint {
     struct list block_chain;
 };
 
+struct arm64_jit_entry_cache_entry {
+    addr_t pc;
+    struct arm64_jit_block *block;
+    uint16_t entry_index;
+    unsigned invalidate_gen;
+};
+
 struct arm64_jit_state {
     struct mmu *mmu;
     struct list *hash;
     size_t hash_size;
     struct list *entry_hash;
     size_t entry_hash_size;
+    struct arm64_jit_entry_cache_entry *entry_cache;
+    size_t entry_cache_size;
     struct arm64_jit_page_bucket *page_hash;
     struct list jetsam;
     lock_t lock;
@@ -210,6 +220,7 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb);
 
 int arm64_jit_trace_mode(void);
 int arm64_jit_verify_mode(void);
+int arm64_jit_branch_reg_fast_mode(void);
 int arm64_jit_handle_verify_sigtrap(void *ctx);
 void arm64_jit_set_saved_pc(addr_t pc);
 void arm64_jit_record_fault_pc(void *host_pc);
@@ -232,6 +243,8 @@ int arm64_jit_helper_verify_trap(struct arm64_jit_runtime *rt, addr_t guest_pc);
 int arm64_jit_helper_dispatch(struct arm64_jit_runtime *rt, addr_t guest_pc);
 int arm64_jit_helper_branch_link(struct arm64_jit_runtime *rt, uint64_t packed);
 int arm64_jit_helper_branch_reg(struct arm64_jit_runtime *rt, addr_t guest_pc, uint32_t insn);
+int arm64_jit_helper_branch_reg_fast_jitabi(struct arm64_jit_runtime *rt, addr_t guest_pc,
+        uint32_t insn, uint64_t target);
 int arm64_jit_helper_cbz_cbnz(struct arm64_jit_runtime *rt, addr_t guest_pc, uint32_t insn);
 int arm64_jit_helper_b_cond(struct arm64_jit_runtime *rt, addr_t guest_pc, uint32_t insn);
 int arm64_jit_helper_tbz_tbnz(struct arm64_jit_runtime *rt, addr_t guest_pc, uint32_t insn);

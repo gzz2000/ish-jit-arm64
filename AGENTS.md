@@ -181,6 +181,30 @@ timeout 20s env ISH_ARM64_BACKEND=arm64_jit ISH_ARM64_JIT_VERIFY=1 ISH_ARM64_JIT
 Do not leave trace enabled on broad benchmark runs unless the scope is tightly
 filtered.
 
+## Experimental Branch-Reg Fast Probe
+
+`ISH_ARM64_JIT_BRANCH_REG_FAST=1` enables the experimental JIT-side
+branch-register resolver. It is intentionally opt-in and should not be treated
+as the default path until broader verifier coverage is clean.
+
+```bash
+timeout 10s env ISH_ARM64_BACKEND=arm64_jit ISH_ARM64_JIT_BRANCH_REG_FAST=1 \
+  ./build-arm64-release/ish -f ./build/alpine-arm64-fakefs /bin/echo hello \
+  > /private/tmp/branch_fast_echo.stdout 2> /private/tmp/branch_fast_echo.stderr
+```
+
+Extra fallback logging is separately gated by:
+
+```bash
+ISH_ARM64_JIT_BRANCH_REG_FAST_DEBUG=1
+```
+
+Important ABI lesson from the first probe: if an experimental JIT helper may
+fall back through a fragment spill snippet, it must restore all live JIT state
+that the spill snippet reads before calling the spill snippet. In practice that
+means restoring any touched cached-register host registers such as `x4` and
+restoring `NZCV` before fallback spill.
+
 ## Dump Mode
 
 Dump mode is independent of verifier mode and works in plain JIT mode.
@@ -275,12 +299,33 @@ The intended memory-helper architecture is:
   - spill/reload around miss
   - permission failure / page fault publication
   - fragment exit on fault
+- shared page helper ABI uses `x4` for `access_kind` (`0=read`, `1=write`);
+  `x3` remains family-specific, such as a scalar store value or load return
+  selector.
 
 The ABI is documented in:
 
 - [/Users/zizhengguo/scratch/ish-arm64/jit/guest-arm64/helpers.S](/Users/zizhengguo/scratch/ish-arm64/jit/guest-arm64/helpers.S)
 
 When changing this architecture, update both that file and this one.
+
+## Current Fragment Lookup Direction
+
+Runtime dispatch now has a direct-mapped PC-to-entry cache in
+`arm64_jit_state`, keyed from `pc >> 2`, with entries guarded by
+`invalidate_gen`. The slow covering-block fallback uses the existing per-guest
+page block lists instead of scanning every block hash bucket.
+
+Important invariants for future JIT-to-JIT transfer work:
+
+- A cached entry is valid only if the block is not jetsam, has executable code,
+  and the entry index still maps to the requested guest PC.
+- Guest page invalidation marks affected blocks jetsam and increments
+  `invalidate_gen`; fast caches must either check that generation or be cleared
+  under the same invalidation path.
+- Same-fragment jumps should use fragment-local guest PC to host offset mapping.
+  Cross-fragment jumps must account for different cached-register maps before
+  branching into the destination body.
 
 ## Best Practices
 

@@ -34,7 +34,7 @@
 //     x0 = rt*
 //     x1 = packed metadata; high 32 bits carry guest_pc
 //     x2 = guest effective address
-//     x3 = access_kind (0=read, 1=write, 2=exec)
+//     x4 = access_kind (0=read, 1=write, 2=exec)
 //   Return on success:
 //     x0 = host page base (page aligned)
 //     x2 = guest effective address (preserved)
@@ -58,8 +58,16 @@
 // arm64_jit_runtime:
 //   cpu = 0
 //   tlb = 8
+//   block = 16
 //   spill_state_fn = 24
 //   reload_state_fn = 32
+// arm64_jit_block:
+//   start_pc = 0
+//   end_pc = 8
+//   insn_count = 24
+//   insn_pcs = 32
+//   code_rx = 37176
+//   insn_host_offsets = 37220
 // cpu_state:
 //   regs = 16
 //   sp = 264
@@ -110,6 +118,135 @@
     str \scratch1, [x20, #8]
     ldr \scratch0, [\out_reg, #16]
     add \out_reg, \scratch0, \scratch1
+.endm
+
+.macro JIT_SIMD_SYNC_CPU_TO_Q rt, ptr
+    cmp \rt, #0
+    b.eq .Ljit_simd_sync_q0_\@
+    cmp \rt, #1
+    b.eq .Ljit_simd_sync_q1_\@
+    cmp \rt, #2
+    b.eq .Ljit_simd_sync_q2_\@
+    cmp \rt, #3
+    b.eq .Ljit_simd_sync_q3_\@
+    cmp \rt, #4
+    b.eq .Ljit_simd_sync_q4_\@
+    cmp \rt, #5
+    b.eq .Ljit_simd_sync_q5_\@
+    cmp \rt, #6
+    b.eq .Ljit_simd_sync_q6_\@
+    cmp \rt, #7
+    b.eq .Ljit_simd_sync_q7_\@
+    cmp \rt, #8
+    b.eq .Ljit_simd_sync_q8_\@
+    cmp \rt, #9
+    b.eq .Ljit_simd_sync_q9_\@
+    cmp \rt, #10
+    b.eq .Ljit_simd_sync_q10_\@
+    cmp \rt, #11
+    b.eq .Ljit_simd_sync_q11_\@
+    cmp \rt, #12
+    b.eq .Ljit_simd_sync_q12_\@
+    cmp \rt, #13
+    b.eq .Ljit_simd_sync_q13_\@
+    cmp \rt, #14
+    b.eq .Ljit_simd_sync_q14_\@
+    cmp \rt, #15
+    b.eq .Ljit_simd_sync_q15_\@
+    cmp \rt, #16
+    b.eq .Ljit_simd_sync_q16_\@
+    cmp \rt, #17
+    b.eq .Ljit_simd_sync_q17_\@
+    cmp \rt, #18
+    b.eq .Ljit_simd_sync_q18_\@
+    cmp \rt, #19
+    b.eq .Ljit_simd_sync_q19_\@
+    cmp \rt, #20
+    b.eq .Ljit_simd_sync_q20_\@
+    cmp \rt, #21
+    b.eq .Ljit_simd_sync_q21_\@
+    cmp \rt, #22
+    b.eq .Ljit_simd_sync_q22_\@
+    cmp \rt, #23
+    b.eq .Ljit_simd_sync_q23_\@
+    cmp \rt, #24
+    b.eq .Ljit_simd_sync_q24_\@
+    cmp \rt, #25
+    b.eq .Ljit_simd_sync_q25_\@
+    cmp \rt, #26
+    b.eq .Ljit_simd_sync_q26_\@
+    cmp \rt, #27
+    b.eq .Ljit_simd_sync_q27_\@
+    cmp \rt, #28
+    b.eq .Ljit_simd_sync_q28_\@
+    cmp \rt, #29
+    b.eq .Ljit_simd_sync_q29_\@
+    cmp \rt, #30
+    b.eq .Ljit_simd_sync_q30_\@
+    ldr q31, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q0_\@:  ldr q0, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q1_\@:  ldr q1, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q2_\@:  ldr q2, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q3_\@:  ldr q3, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q4_\@:  ldr q4, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q5_\@:  ldr q5, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q6_\@:  ldr q6, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q7_\@:  ldr q7, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q8_\@:  ldr q8, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q9_\@:  ldr q9, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q10_\@: ldr q10, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q11_\@: ldr q11, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q12_\@: ldr q12, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q13_\@: ldr q13, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q14_\@: ldr q14, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q15_\@: ldr q15, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q16_\@: ldr q16, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q17_\@: ldr q17, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q18_\@: ldr q18, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q19_\@: ldr q19, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q20_\@: ldr q20, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q21_\@: ldr q21, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q22_\@: ldr q22, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q23_\@: ldr q23, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q24_\@: ldr q24, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q25_\@: ldr q25, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q26_\@: ldr q26, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q27_\@: ldr q27, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q28_\@: ldr q28, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q29_\@: ldr q29, [\ptr]
+    b .Ljit_simd_sync_done_\@
+.Ljit_simd_sync_q30_\@: ldr q30, [\ptr]
+.Ljit_simd_sync_done_\@:
 .endm
 
 .macro JITABI_WRAP1 name, target
@@ -326,7 +463,7 @@
 //   x0 = rt*
 //   x1 = packed guest_pc/metadata; guest_pc is in the high 32 bits
 //   x2 = guest_addr
-//   x3 = access_kind (MEM_READ=0, MEM_WRITE=1)
+//   x4 = access_kind (MEM_READ=0, MEM_WRITE=1)
 // Outputs on success:
 //   x0 = host_page_base
 //   w1 = -1 (INT_NONE)
@@ -679,8 +816,10 @@ _arm64_jit_mem_lookup_page_live:
     ldr x6, [x0, #8]               // tlb*
     ldr x1, [sp, #96]              // guest_addr
     ldr x2, [sp, #104]             // access_kind
+    str x5, [sp, #72]              // profile base across C miss handler
     mov x0, x6                     // tlb*
     bl _tlb_handle_miss
+    ldr x5, [sp, #72]              // profile base
     cbz x0, 3f
     cmp x5, #0
     b.eq 93f
@@ -1637,6 +1776,13 @@ _arm64_jit_helper_simd_ldst_imm_unsigned_live:
     str x2, [x0, #8]
 
 20:
+    ldr w16, [sp, #136]
+    ubfx x17, x16, #22, #2
+    tst x17, #0x1
+    b.eq 21f
+    ubfx x17, x16, #0, #5
+    JIT_SIMD_SYNC_CPU_TO_Q x17, x0
+21:
     ldr w1, [sp, #140]
     add x1, x1, #4
     ldr x16, [sp, #128]
@@ -2479,7 +2625,7 @@ _arm64_jit_helper_ldst_regoff_live:
 
     ldr x1, [sp, #40]              // packed
     mov x0, x21
-    mov x3, #1
+    mov x4, #1
     bl _arm64_jit_mem_lookup_page_live
     ldr x1, [sp, #40]              // packed
     ldr x3, [sp, #56]              // store value
@@ -3555,6 +3701,88 @@ JITABI_WRAP2 _arm64_jit_helper_cbz_cbnz_jitabi, _arm64_jit_helper_cbz_cbnz
 JITABI_WRAP2 _arm64_jit_helper_b_cond_jitabi, _arm64_jit_helper_b_cond
 JITABI_WRAP2 _arm64_jit_helper_tbz_tbnz_jitabi, _arm64_jit_helper_tbz_tbnz
 JITABI_WRAP2 _arm64_jit_helper_branch_reg_jitabi, _arm64_jit_helper_branch_reg
+.globl _arm64_jit_helper_branch_reg_fast_jitabi
+_arm64_jit_helper_branch_reg_fast_jitabi:
+    stp x29, x30, [sp, #-80]!
+    stp x16, x17, [sp, #16]
+    stp x0, x1, [sp, #32]
+    stp x2, x3, [sp, #48]
+    str x4, [sp, #64]
+
+    // Experimental opt-in branch-reg resolver. Falls back to the normal C
+    // helper path on any miss; success tail-branches inside the same fragment.
+    mrs x4, nzcv
+    str x4, [sp, #72]
+    ubfx x4, x2, #21, #4        // branch-register opc
+    cmp x4, #2                  // RET only for now
+    b.ne 2f
+    ldr x16, [x0, #16]          // rt->block
+    cbz x16, 2f
+    ldr x17, [x16]              // block->start_pc
+    cmp x3, x17
+    b.lo 2f
+    ldr x17, [x16, #8]          // block->end_pc
+    cmp x3, x17
+    b.hs 2f
+    tst x3, #3
+    b.ne 2f
+    ldr w17, [x16, #24]         // block->insn_count
+    add x4, x16, #32            // block->insn_pcs
+0:
+    cbz x17, 2f
+    ldr x30, [x4], #8
+    eor x30, x30, x3
+    cbz x30, 1f
+    sub x17, x17, #1
+    b 0b
+1:
+    ldr w30, [x16, #24]         // block->insn_count
+    sub x4, x30, x17            // matched index
+    mov x17, #0x9164            // block->insn_host_offsets
+    add x17, x16, x17
+    ldr w17, [x17, x4, lsl #2]
+    cmn w17, #1                 // UINT32_MAX is invalid
+    b.eq 2f
+    mov x4, #0x9138             // block->code_rx
+    ldr x16, [x16, x4]
+    add x3, x16, x17
+    ldr x4, [sp, #72]
+    msr nzcv, x4
+    ldr x4, [sp, #64]
+    ldr x2, [sp, #48]
+    ldp x0, x1, [sp, #32]
+    ldp x16, x17, [sp, #16]
+    ldp x29, x30, [sp], #80
+    br x3
+
+2:
+    // The miss path calls the fragment spill snippet. Restore any live JIT
+    // state touched by this probe before spilling cached guest registers.
+    ldr x4, [sp, #72]
+    msr nzcv, x4
+    ldr x4, [sp, #64]
+    mov x16, x0
+    ldr x17, [x16, #24]
+    cbz x17, 3f
+    blr x17
+3:
+    ldp x0, x1, [sp, #32]
+    ldr x2, [sp, #48]
+    bl _arm64_jit_helper_branch_reg
+    add w17, w0, #1
+    cbnz w17, 4f
+    ldr x16, [sp, #32]
+    ldr x17, [x16, #32]
+    cbz x17, 4f
+    str x0, [sp, #56]
+    mov x0, x16
+    blr x17
+    ldr x0, [sp, #56]
+4:
+    ldr x4, [sp, #64]
+    ldp x16, x17, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
 JITABI_WRAP2 _arm64_jit_helper_ldst_imm9_jitabi, _arm64_jit_helper_ldst_imm9
 JITABI_WRAP2_SUCCESS _arm64_jit_helper_ldst_imm9_success_jitabi, _arm64_jit_helper_ldst_imm9
 JITABI_WRAP2 _arm64_jit_helper_ldst_regoff_jitabi, _arm64_jit_helper_ldst_regoff

@@ -86,6 +86,8 @@ static int real_tty_init(struct tty *tty) {
     if (tty->num != REAL_TTY_NUM)
         return 0;
 
+    bool stdin_is_tty = isatty(STDIN_FILENO);
+
     struct winsize winsz;
     if (ioctl(STDIN_FILENO, TIOCGWINSZ, &winsz) < 0) {
         if (errno == ENOTTY)
@@ -110,6 +112,11 @@ static int real_tty_init(struct tty *tty) {
     if (tcsetattr(STDIN_FILENO, TCSANOW, &termios) < 0)
         ERRNO_DIE("failed to set terminal to raw mode");
 notty:
+
+    if (!stdin_is_tty) {
+        real_tty_is_open = true;
+        return 0;
+    }
 
     if (pthread_create(&tty->thread, NULL,  real_tty_read_thread, tty) < 0)
         // ok if this actually happened it would be weird AF
@@ -137,7 +144,8 @@ static void real_tty_cleanup(struct tty *tty) {
     if (tty->num != REAL_TTY_NUM)
         return;
     real_tty_reset_term();
-    pthread_cancel(tty->thread);
+    if (isatty(STDIN_FILENO))
+        pthread_cancel(tty->thread);
 }
 
 struct tty_driver_ops real_tty_ops = {

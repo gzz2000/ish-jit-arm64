@@ -193,6 +193,36 @@ static struct fd *open_fd_from_actual_fd(int fd_no) {
     return fd;
 }
 
+int create_mixed_stdio(const char *file, int major, int minor) {
+    struct fd *tty_fd = generic_open(file, O_RDWR_, 0);
+    if (!IS_ERR(tty_fd) && !S_ISCHR(tty_fd->stat.mode)) {
+        fd_close(tty_fd);
+        tty_fd = ERR_PTR(_ENOENT);
+    }
+    if (IS_ERR(tty_fd)) {
+        tty_fd = adhoc_fd_create(NULL);
+        tty_fd->stat.rdev = dev_make(major, minor);
+        tty_fd->stat.mode = S_IFCHR | S_IRUSR;
+        tty_fd->flags = O_RDWR_;
+        int err = dev_open(major, minor, DEV_CHAR, tty_fd);
+        if (err < 0)
+            return err;
+    }
+
+    struct fd *stdin_fd = open_fd_from_actual_fd(STDIN_FILENO);
+    if (stdin_fd == NULL) {
+        fd_close(tty_fd);
+        return -1;
+    }
+
+    tty_fd->refcount = 0;
+    stdin_fd->refcount = 0;
+    current->files->files[0] = stdin_fd;
+    current->files->files[1] = fd_retain(tty_fd);
+    current->files->files[2] = fd_retain(tty_fd);
+    return 0;
+}
+
 int create_piped_stdio() {
     if (!(current->files->files[0] = open_fd_from_actual_fd(STDIN_FILENO))) {
         return -1;

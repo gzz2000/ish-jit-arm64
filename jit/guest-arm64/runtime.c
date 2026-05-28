@@ -141,11 +141,29 @@ static bool arm64_jit_should_dump_block(const struct arm64_jit_block *block) {
     const char *filter = arm64_jit_dump_filter();
     if (filter == NULL || filter[0] == '\0')
         return true;
+    char *endptr = NULL;
+    unsigned long long want_pc = strtoull(filter, &endptr, 0);
+    bool exact_pc = (endptr != NULL && *endptr == '\0');
+    if (exact_pc) {
+        for (uint32_t i = 0; i < block->insn_count; i++) {
+            if ((unsigned long long) block->insn_pcs[i] == want_pc)
+                return true;
+        }
+    }
     char span[64];
     snprintf(span, sizeof(span), "0x%llx..0x%llx",
             (unsigned long long) block->start_pc,
             (unsigned long long) block->end_pc);
-    return strstr(span, filter) != NULL;
+    if (strstr(span, filter) != NULL)
+        return true;
+    for (uint32_t i = 0; i < block->insn_count; i++) {
+        char pc[32];
+        snprintf(pc, sizeof(pc), "0x%llx",
+                (unsigned long long) block->insn_pcs[i]);
+        if (strstr(pc, filter) != NULL)
+            return true;
+    }
+    return false;
 }
 
 static void arm64_jit_dump_json_string(FILE *out, const char *s) {
@@ -243,9 +261,13 @@ static struct arm64_jit_state *arm64_jit_state_new(struct mmu *mmu) {
     state->hash = calloc(state->hash_size, sizeof(struct list));
     state->entry_hash_size = ARM64_JIT_HASH_SIZE;
     state->entry_hash = calloc(state->entry_hash_size, sizeof(struct list));
+    state->entry_cache_size = ARM64_JIT_ENTRY_CACHE_SIZE;
+    state->entry_cache = calloc(state->entry_cache_size, sizeof(*state->entry_cache));
     state->page_hash = calloc(ARM64_JIT_PAGE_HASH_SIZE, sizeof(*state->page_hash));
-    if (state->hash == NULL || state->entry_hash == NULL || state->page_hash == NULL) {
+    if (state->hash == NULL || state->entry_hash == NULL ||
+            state->entry_cache == NULL || state->page_hash == NULL) {
         free(state->page_hash);
+        free(state->entry_cache);
         free(state->entry_hash);
         free(state->hash);
         free(state);
@@ -302,6 +324,24 @@ int arm64_jit_verify_mode(void) {
         verify_mode = (env != NULL && env[0] == '1') ? 1 : 0;
     }
     return verify_mode;
+}
+
+int arm64_jit_branch_reg_fast_mode(void) {
+    static int fast_mode = -1;
+    if (fast_mode == -1) {
+        const char *env = getenv("ISH_ARM64_JIT_BRANCH_REG_FAST");
+        fast_mode = (env != NULL && env[0] == '1') ? 1 : 0;
+    }
+    return fast_mode;
+}
+
+static int arm64_jit_branch_reg_fast_debug_mode(void) {
+    static int debug_mode = -1;
+    if (debug_mode == -1) {
+        const char *env = getenv("ISH_ARM64_JIT_BRANCH_REG_FAST_DEBUG");
+        debug_mode = (env != NULL && env[0] == '1') ? 1 : 0;
+    }
+    return debug_mode;
 }
 
 static const struct arm64_jit_verify_site *arm64_jit_find_verify_site(
@@ -591,6 +631,20 @@ int arm64_jit_helper_branch_reg(struct arm64_jit_runtime *rt, addr_t guest_pc, u
     uint32_t opc = (insn >> 21) & 0xf;
     uint32_t rn = ARM64_RN(insn);
     uint64_t target = arm64_jit_read_gpr(rt->cpu, rn, false);
+    if (arm64_jit_branch_reg_fast_debug_mode()) {
+        static uint64_t log_count;
+        uint64_t count = __atomic_fetch_add(&log_count, 1, __ATOMIC_RELAXED);
+        if (count < 128 || (count & 0xffff) == 0) {
+            fprintf(stderr,
+                    "[arm64-jit-branch-fast] fallback count=%llu pc=0x%llx opc=%u rn=%u target=0x%llx lr=0x%llx\n",
+                    (unsigned long long) count,
+                    (unsigned long long) guest_pc,
+                    opc,
+                    rn,
+                    (unsigned long long) target,
+                    (unsigned long long) rt->cpu->regs[30]);
+        }
+    }
 
     switch (opc) {
         case 0: // BR
@@ -1684,10 +1738,11 @@ int arm64_jit_c_str_imm_unsigned(struct arm64_jit_runtime *rt, uint64_t packed) 
     uint64_t value = arm64_jit_read_gpr(rt->cpu, rt_reg, false);
     if (arm64_jit_trace_mode() && guest_pc == 0xefe73550) {
         fprintf(stderr,
-                "[arm64-jit] str_uimm pc=0x%llx rt=%u rn=%u size=%u imm12=%u addr=0x%llx value=0x%llx tlb_changes=%u mmu_changes=%u\n",
+                "[arm64-jit] str_uimm pc=0x%llx rt=%u rn=%u size=%u imm12=%u addr=0x%llx value=0x%llx tlb_changes=%u mmu_changes=%llu\n",
                 (unsigned long long) guest_pc, rt_reg, rn_reg, size_shift, imm12,
                 (unsigned long long) addr, (unsigned long long) value,
-                rt->tlb->mem_changes, __atomic_load_n(&rt->tlb->mmu->changes, __ATOMIC_ACQUIRE));
+                rt->tlb->mem_changes,
+                (unsigned long long) __atomic_load_n(&rt->tlb->mmu->changes, __ATOMIC_ACQUIRE));
     }
     int rc = -1;
     if (size_shift == 3)
@@ -2746,6 +2801,50 @@ static int arm64_jit_find_insn_index(const struct arm64_jit_block *block, addr_t
     return -1;
 }
 
+static bool arm64_jit_block_entry_valid(const struct arm64_jit_block *block, addr_t pc,
+        uint32_t entry_index) {
+    if (block == NULL || block->code_rx == NULL || block->is_jetsam)
+        return false;
+    if (entry_index >= block->insn_count || block->insn_pcs[entry_index] != pc)
+        return false;
+    if (entry_index == 0)
+        return pc == block->start_pc;
+    return block->entry_code[entry_index] != NULL &&
+            block->insn_host_offsets[entry_index] != UINT32_MAX;
+}
+
+static size_t arm64_jit_entry_cache_index(const struct arm64_jit_state *state, addr_t pc) {
+    return (((size_t) pc >> 2) ^ ((size_t) pc >> 14)) % state->entry_cache_size;
+}
+
+static bool arm64_jit_lookup_entry_cache(struct arm64_jit_state *state, addr_t pc,
+        struct arm64_jit_block **block_out, int *entry_index_out) {
+    if (state->entry_cache == NULL || state->entry_cache_size == 0)
+        return false;
+    struct arm64_jit_entry_cache_entry *cache =
+            &state->entry_cache[arm64_jit_entry_cache_index(state, pc)];
+    if (cache->pc != pc || cache->invalidate_gen != state->invalidate_gen)
+        return false;
+    if (!arm64_jit_block_entry_valid(cache->block, pc, cache->entry_index))
+        return false;
+    *block_out = cache->block;
+    *entry_index_out = cache->entry_index;
+    return true;
+}
+
+static void arm64_jit_update_entry_cache(struct arm64_jit_state *state, addr_t pc,
+        struct arm64_jit_block *block, int entry_index) {
+    if (state->entry_cache == NULL || state->entry_cache_size == 0 ||
+            entry_index < 0 || !arm64_jit_block_entry_valid(block, pc, (uint32_t) entry_index))
+        return;
+    struct arm64_jit_entry_cache_entry *cache =
+            &state->entry_cache[arm64_jit_entry_cache_index(state, pc)];
+    cache->pc = pc;
+    cache->block = block;
+    cache->entry_index = (uint16_t) entry_index;
+    cache->invalidate_gen = state->invalidate_gen;
+}
+
 static bool arm64_jit_block_has_valid_entry_for_pc(const struct arm64_jit_block *block, addr_t pc) {
     if (block == NULL || block->code_rx == NULL || block->is_jetsam)
         return false;
@@ -2762,13 +2861,14 @@ static struct arm64_jit_block *arm64_jit_lookup_covering_block(struct arm64_jit_
     struct arm64_jit_block *best = NULL;
     uint32_t best_span = UINT32_MAX;
     int best_index = -1;
+    page_t page = PAGE(pc);
 
-    for (size_t b = 0; b < state->hash_size; b++) {
-        struct list *bucket = &state->hash[b];
+    for (int list_idx = 0; list_idx <= 1; list_idx++) {
+        struct list *bucket = arm64_jit_blocks_list(state, page, list_idx);
         struct arm64_jit_block *block;
         if (list_null(bucket))
             continue;
-        list_for_each_entry(bucket, block, hash_chain) {
+        list_for_each_entry(bucket, block, page[list_idx]) {
             if (block->is_jetsam || block->code_rx == NULL)
                 continue;
             if (block->start_pc == pc)
@@ -3728,13 +3828,14 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb) {
             tlb_flush(tlb);
 
         lock(&state->lock);
-        struct arm64_jit_entrypoint *ep = arm64_jit_lookup_entry(state, cpu->pc);
         struct arm64_jit_block *block = NULL;
         int entry_index = 0;
+        bool cache_hit = arm64_jit_lookup_entry_cache(state, cpu->pc, &block, &entry_index);
+        struct arm64_jit_entrypoint *ep = cache_hit ? NULL : arm64_jit_lookup_entry(state, cpu->pc);
         if (arm64_jit_trace_mode() && (cpu->pc == 0xeff84158 || cpu->pc == 0xefeb64a4)) {
             struct arm64_jit_block *exact = arm64_jit_lookup(state, cpu->pc);
-            fprintf(stderr, "[arm64-jit] dispatch-%llx exact=%p ep=%p\n",
-                    (unsigned long long) cpu->pc, (void *) exact, (void *) ep);
+            fprintf(stderr, "[arm64-jit] dispatch-%llx exact=%p ep=%p cache_hit=%d\n",
+                    (unsigned long long) cpu->pc, (void *) exact, (void *) ep, cache_hit);
             if (ep != NULL && ep->block != NULL) {
                 fprintf(stderr, "[arm64-jit] dispatch-%llx ep-block=0x%llx idx=%u entry=%p off=0x%x code=%p\n",
                         (unsigned long long) cpu->pc,
@@ -3745,7 +3846,9 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb) {
                         ep->block->code_rx);
             }
         }
-        if (ep != NULL) {
+        if (cache_hit) {
+            // block/entry_index already populated by the direct-mapped entry cache.
+        } else if (ep != NULL) {
             block = ep->block;
             entry_index = ep->entry_index;
         } else {
@@ -3786,6 +3889,8 @@ int cpu_run_to_interrupt_arm64_jit(struct cpu_state *cpu, struct tlb *tlb) {
                 }
             }
         }
+        if (block != NULL)
+            arm64_jit_update_entry_cache(state, cpu->pc, block, entry_index);
         unlock(&state->lock);
 
         if (block == NULL || block->code_rx == NULL) {

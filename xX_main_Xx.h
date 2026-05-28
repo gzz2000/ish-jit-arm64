@@ -283,7 +283,8 @@ do_exec:
     if (err < 0)
         return err;
     tty_drivers[TTY_CONSOLE_MAJOR] = &real_tty_driver;
-    if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+    bool stdout_is_tty = isatty(STDOUT_FILENO);
+    if (stdout_is_tty) {
         err = create_stdio(console, TTY_CONSOLE_MAJOR, 1);
         if (err < 0)
             return err;
